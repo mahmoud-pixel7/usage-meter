@@ -1,0 +1,24 @@
+Usage Meter
+Copyright (c) 2026 mahmoud-pixel7 (Usage Meter modifications)
+
+Usage Meter is based on LANtern Control:
+https://github.com/humane125/LANtern-Control
+Copyright (c) 2026 humane125
+Licensed under the MIT License.
+
+Usage Meter is a modified version of LANtern Control. It was not written from
+scratch. The original device discovery, ARP engine, packet capture, speed
+limits, domain features and user interface come from LANtern Control.
+
+Usage Meter modifications:
+- A cumulative per-device usage ledger keyed by MAC address, with download,
+  upload and total bytes that survive restarts.
+- Usage totals saved to %LOCALAPPDATA%\UsageMeter\usage.json, with settings in
+  %LOCALAPPDATA%\UsageMeter\settings.json, using safe writes and backups.
+- Total download, total upload and total usage columns in the Windows UI.
+- The inherited update check against the LANtern Control releases was removed
+  from the Windows application.
+- Renamed to Usage Meter, version 1.0.0.
+
+The full license text is in the LICENSE file. Third-party components are listed
+in THIRD-PARTY-NOTICES.txt.

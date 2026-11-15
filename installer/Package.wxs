@@ -1,0 +1,83 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Usage Meter"
+           Manufacturer="Usage Meter"
+           Version="1.0.0"
+           UpgradeCode="4F2270F2-9144-4167-B5D5-A7CE75B5F00A"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Language="1033">
+    <SummaryInformation Description="Usage Meter installer"
+                        Manufacturer="Usage Meter" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of Usage Meter is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="AppIcon" SourceFile="..\src\Lantern.App\Assets\RedWatcher.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Usage Meter" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Usage Meter">
+        <Component Id="StartMenuShortcutComponent">
+          <Shortcut Id="StartMenuShortcut"
+                    Name="Usage Meter"
+                    Description="Usage Meter"
+                    Target="[INSTALLFOLDER]Usage Meter.exe"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="AppIcon" />
+          <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+          <RegistryValue Root="HKCU"
+                         Key="Software\Usage Meter"
+                         Name="StartMenuShortcut"
+                         Type="integer"
+                         Value="1"
+                         KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcutComponent">
+        <Shortcut Id="DesktopShortcut"
+                  Name="Usage Meter"
+                  Description="Usage Meter"
+                  Target="[INSTALLFOLDER]Usage Meter.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="AppIcon" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\Usage Meter"
+                       Name="DesktopShortcut"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="ApplicationFeature"
+             Title="Usage Meter application"
+             Description="Required application files."
+             Level="1"
+             AllowAbsent="no">
+      <Files Include="$(var.PublishDir)\**" Directory="INSTALLFOLDER" />
+    </Feature>
+    <Feature Id="StartMenuShortcutFeature"
+             Title="Start Menu shortcut"
+             Description="Create a Start Menu shortcut."
+             Level="1">
+      <ComponentRef Id="StartMenuShortcutComponent" />
+    </Feature>
+    <Feature Id="DesktopShortcutFeature"
+             Title="Desktop shortcut"
+             Description="Create a desktop shortcut."
+             Level="200">
+      <ComponentRef Id="DesktopShortcutComponent" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_Mondo" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+  </Package>
+</Wix>

@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\RedWatcher.ico</ApplicationIcon>
+    <AssemblyName>Usage Meter</AssemblyName>
+    <RootNamespace>Lantern.App</RootNamespace>
+    <Version>1.0.0</Version>
+    <Product>Usage Meter</Product>
+    <Description>Per-device LAN usage meter for Windows, based on LANtern Control.</Description>
+    <Authors>Usage Meter contributors</Authors>
+    <Copyright>Copyright (c) 2026 humane125 (LANtern Control); Copyright (c) 2026 mahmoud-pixel7 (Usage Meter modifications)</Copyright>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <PublishSingleFile>false</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SharpPcap" Version="6.3.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Lantern.Core\Lantern.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\THIRD-PARTY-NOTICES.txt">
+      <Link>THIRD-PARTY-NOTICES.txt</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
+  </ItemGroup>
+</Project>
