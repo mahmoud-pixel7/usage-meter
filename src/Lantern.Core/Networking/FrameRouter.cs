@@ -19,7 +19,8 @@ public sealed record FrameRouteResult(
     byte[]? Frame = null,
     int MeteredByteCount = 0,
     DomainObservation? Observation = null,
-    bool BlockedByDomain = false);
+    bool BlockedByDomain = false,
+    FrameIgnoreReason IgnoreReason = FrameIgnoreReason.None);
 
 public sealed class FrameRouter
 {
@@ -29,6 +30,7 @@ public sealed class FrameRouter
     private readonly PhysicalAddress gatewayMac;
     private readonly TrafficPolicy policy;
     private readonly bool enforceRateLimits;
+    private readonly AdapterProfile? adapter;
     private readonly ConcurrentDictionary<IPAddress, PhysicalAddress> clients;
     private readonly ConcurrentDictionary<ObservedFlowKey, string> observedFlowDomains = [];
 
@@ -38,19 +40,30 @@ public sealed class FrameRouter
         PhysicalAddress gatewayMac,
         IReadOnlyDictionary<IPAddress, PhysicalAddress> clients,
         TrafficPolicy policy,
-        bool enforceRateLimits = true)
+        bool enforceRateLimits = true,
+        AdapterProfile? adapter = null)
     {
         this.localMac = localMac;
         this.localIp = localIp;
         this.gatewayMac = gatewayMac;
         this.policy = policy;
         this.enforceRateLimits = enforceRateLimits;
-        this.clients = new ConcurrentDictionary<IPAddress, PhysicalAddress>(clients);
+        this.adapter = adapter;
+        this.clients = new ConcurrentDictionary<IPAddress, PhysicalAddress>();
+        foreach (var client in clients)
+        {
+            UpdateClient(client.Key, client.Value);
+        }
     }
 
     public void UpdateClient(IPAddress address, PhysicalAddress macAddress)
     {
-        if (!address.Equals(localIp))
+        if (TrafficMetering.IsUnicastIpv4(address) &&
+            TrafficMetering.IsUnicastMac(macAddress) &&
+            !address.Equals(localIp) && !macAddress.Equals(localMac) &&
+            !macAddress.Equals(gatewayMac) &&
+            (adapter is null ||
+             TrafficMetering.CanInterceptClient(adapter, address, macAddress, gatewayMac)))
         {
             foreach (var staleAddress in clients
                          .Where(pair =>
@@ -72,7 +85,25 @@ public sealed class FrameRouter
     {
         if (!EthernetFrameCodec.TryParseIpv4(frame, out var ipv4))
         {
-            return new FrameRouteResult(FrameAction.Ignore);
+            return new FrameRouteResult(
+                FrameAction.Ignore,
+                IgnoreReason: TrafficMetering.ClassifyProtocol(frame) == CapturedNetworkProtocol.Ipv6
+                    ? FrameIgnoreReason.Ipv6ObservationOnly
+                    : FrameIgnoreReason.InvalidOrUnsupportedFrame);
+        }
+
+        if (ipv4.Source.Equals(localIp) || ipv4.Destination.Equals(localIp))
+        {
+            return new FrameRouteResult(
+                FrameAction.Ignore,
+                IgnoreReason: FrameIgnoreReason.LocalComputerTraffic);
+        }
+
+        if (!ipv4.DestinationMac.Equals(localMac))
+        {
+            return new FrameRouteResult(
+                FrameAction.Ignore,
+                IgnoreReason: FrameIgnoreReason.NotAddressedToController);
         }
 
         TransportFlow? transportFlow =
@@ -80,13 +111,7 @@ public sealed class FrameRouter
                 ? parsedFlow
                 : null;
 
-        if (ipv4.Source.Equals(localIp) || ipv4.Destination.Equals(localIp))
-        {
-            return new FrameRouteResult(FrameAction.Ignore);
-        }
-
-        if (ipv4.DestinationMac.Equals(localMac) &&
-            clients.TryGetValue(ipv4.Source, out var uploadClientMac) &&
+        if (clients.TryGetValue(ipv4.Source, out var uploadClientMac) &&
             ipv4.SourceMac.Equals(uploadClientMac))
         {
             DomainObservation? observation =
@@ -117,7 +142,11 @@ public sealed class FrameRouter
                 transportFlow);
         }
 
-        return new FrameRouteResult(FrameAction.Ignore);
+        return new FrameRouteResult(
+            FrameAction.Ignore,
+            IgnoreReason: clients.ContainsKey(ipv4.Source) || clients.ContainsKey(ipv4.Destination)
+                ? FrameIgnoreReason.ClientBindingMismatch
+                : FrameIgnoreReason.UnknownClient);
     }
 
     private FrameRouteResult RouteForClient(

@@ -50,20 +50,7 @@ public sealed class UsageTracker
     {
         lock (saveSync)
         {
-            if (!loaded)
-            {
-                return false;
-            }
-
-            var snapshot = registry.Usage.Export();
-            if (snapshot.Revision == savedRevision)
-            {
-                return false;
-            }
-
-            store.Save(snapshot.Devices);
-            savedRevision = snapshot.Revision;
-            return true;
+            return SaveIfChangedCore();
         }
     }
 
@@ -71,12 +58,36 @@ public sealed class UsageTracker
         Task.Run(SaveIfChanged, cancellationToken);
 
     /// <summary>
-    /// Moves bytes that have not been through a snapshot yet into the ledger and saves.
-    /// Used when the app closes or Windows ends the session.
+    /// Moves pending bytes into the ledger and saves, independently of UI snapshots.
+    /// Flushes and saves are serialized even when multiple callers share this tracker.
     /// </summary>
     public bool FlushAndSave()
     {
-        registry.FlushPendingUsage();
-        return SaveIfChanged();
+        lock (saveSync)
+        {
+            registry.FlushPendingUsage();
+            return SaveIfChangedCore();
+        }
+    }
+
+    public Task<bool> FlushAndSaveAsync(CancellationToken cancellationToken = default) =>
+        Task.Run(FlushAndSave, cancellationToken);
+
+    private bool SaveIfChangedCore()
+    {
+        if (!loaded)
+        {
+            return false;
+        }
+
+        var snapshot = registry.Usage.Export();
+        if (snapshot.Revision == savedRevision)
+        {
+            return false;
+        }
+
+        store.Save(snapshot.Devices);
+        savedRevision = snapshot.Revision;
+        return true;
     }
 }

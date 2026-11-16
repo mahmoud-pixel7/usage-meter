@@ -26,10 +26,29 @@ public partial class MainWindow : Window
     private static readonly TimeSpan UsageSaveInterval = TimeSpan.FromSeconds(30);
     private readonly DeviceRegistry registry = new();
     private readonly TrafficPolicy policy = new();
-    private readonly SettingsStore settingsStore = new();
+    private readonly SettingsStore settingsStore;
     private readonly UsageTracker usageTracker;
+    private readonly Func<IReadOnlyList<AdapterProfile>> getAdapters;
     private readonly SemaphoreSlim identitySaveSync = new(1, 1);
+    private readonly SemaphoreSlim settingsSaveSync = new(1, 1);
     private readonly DispatcherTimer refreshTimer;
+    private readonly DispatcherTimer domainRefreshTimer;
+    private readonly DispatcherTimer settingsSaveTimer;
+    private readonly DomainObservationBuffer domainBuffer = new();
+    private readonly Dictionary<string, double> pageScrollOffsets = new(StringComparer.Ordinal);
+    private UsagePersistenceService? usagePersistence;
+    private TaskCompletionSource<bool>? operationCompletion;
+    private string currentPageName = "OverviewSection";
+    private string? loadWarning;
+    private string? usageSaveWarning;
+    private string? settingsSaveWarning;
+    private long omittedDomainObservations;
+    private long settingsRevision;
+    private long savedSettingsRevision;
+    private bool dataReady;
+    private bool loadStarted;
+    private bool closingInProgress;
+    private bool deviceOrderingDirty;
     private readonly Dictionary<string, DeviceViewModel> deviceIndex =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DeviceActivityViewModel> websiteActivityIndex =
@@ -40,32 +59,49 @@ public partial class MainWindow : Window
     private PcapLanEngine engine;
     private AppSettings settings = new();
     private DateTimeOffset? controlStartedAt;
-    private DateTimeOffset lastUsageSaveAttempt = DateTimeOffset.UtcNow;
     private bool operationInProgress;
     private bool closeAfterStop;
-    private bool settingsDirty;
-    private bool usageSaveInProgress;
 
     public string VersionText =>
         $"v{(typeof(MainWindow).Assembly.GetName().Version ?? new Version()).ToString(3)}";
 
     public MainWindow()
+        : this(new SettingsStore(), new UsageStore(), WindowsAdapterService.GetUsableAdapters)
     {
+    }
+
+    internal MainWindow(
+        SettingsStore settingsStore,
+        UsageStore usageStore,
+        Func<IReadOnlyList<AdapterProfile>> getAdapters)
+    {
+        this.settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
+        this.getAdapters = getAdapters ?? throw new ArgumentNullException(nameof(getAdapters));
         InitializeComponent();
         DataContext = this;
         SidebarVersionText.Text = VersionText;
         DomainPresetSelector.ItemsSource = DomainPresets;
-        usageTracker = new UsageTracker(registry, new UsageStore());
+        usageTracker = new UsageTracker(registry, usageStore);
         engine = new PcapLanEngine(registry, policy);
         engine.StatusChanged += Engine_OnStatusChanged;
         engine.StateChanged += Engine_OnStateChanged;
         engine.DeviceIdentityLearned += Engine_OnDeviceIdentityLearned;
         engine.DeviceDomainObserved += Engine_OnDeviceDomainObserved;
-        refreshTimer = new DispatcherTimer(
-            TrafficSamplingProfile.Interval,
-            DispatcherPriority.Background,
-            RefreshDevices,
-            Dispatcher);
+        refreshTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+        {
+            Interval = TrafficSamplingProfile.Interval,
+        };
+        refreshTimer.Tick += RefreshDevices;
+        domainRefreshTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+        {
+            Interval = TimeSpan.FromMilliseconds(200),
+        };
+        domainRefreshTimer.Tick += DrainDomainObservations;
+        settingsSaveTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+        {
+            Interval = UsageSaveInterval,
+        };
+        settingsSaveTimer.Tick += SettingsSaveTimer_OnTick;
         Loaded += MainWindow_OnLoaded;
         Closing += MainWindow_OnClosing;
 
@@ -74,10 +110,6 @@ public partial class MainWindow : Window
             new SortDescription(nameof(DeviceViewModel.IsProtected), ListSortDirection.Ascending));
         view.SortDescriptions.Add(
             new SortDescription(nameof(DeviceViewModel.DisplayName), ListSortDirection.Ascending));
-
-        var activityView = CollectionViewSource.GetDefaultView(WebsiteActivity);
-        activityView.SortDescriptions.Add(
-            new SortDescription(nameof(DeviceActivityViewModel.LastSeen), ListSortDirection.Descending));
 
         var groupView = CollectionViewSource.GetDefaultView(DeviceActivityGroups);
         groupView.SortDescriptions.Add(
@@ -94,6 +126,9 @@ public partial class MainWindow : Window
             new SortDescription(nameof(DomainPresetRuleViewModel.DeviceName), ListSortDirection.Ascending));
         domainPresetRuleView.SortDescriptions.Add(
             new SortDescription(nameof(DomainPresetRuleViewModel.PresetName), ListSortDirection.Ascending));
+        CollectionViewSource.GetDefaultView(DomainRuleDevices).SortDescriptions.Add(
+            new SortDescription(nameof(DeviceViewModel.DisplayName), ListSortDirection.Ascending));
+        UpdateButtons();
     }
 
     public ObservableCollection<DeviceViewModel> Devices { get; } = [];
@@ -110,55 +145,116 @@ public partial class MainWindow : Window
 
     public IReadOnlyList<DomainBlockPreset> DomainPresets => DomainBlockPresetCatalog.All;
 
-    private async void MainWindow_OnLoaded(object sender, RoutedEventArgs eventArgs)
+    private async void MainWindow_OnLoaded(object sender, RoutedEventArgs eventArgs) =>
+        await LoadSavedDataAsync();
+
+    internal async Task LoadSavedDataAsync()
     {
-        // Usage Meter does not check GitHub for updates: the inherited LANtern Control
-        // checker would offer to replace this app with an upstream LANtern release.
+        if (loadStarted)
+        {
+            return;
+        }
+
+        loadStarted = true;
+        // Usage Meter must not offer an upstream LANtern release as its own update.
+        var loadErrors = new List<string>();
         try
         {
             await usageTracker.LoadAsync();
         }
         catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException)
+            exception is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException)
         {
-            DetailStatusText.Text = $"Could not load saved usage: {exception.Message}";
+            loadErrors.Add($"Could not load saved usage: {exception.Message}");
         }
 
-        settings = await settingsStore.LoadAsync();
-        LoadDomainRulesFromSettings();
-        var adapters = WindowsAdapterService.GetUsableAdapters();
-        AdapterSelector.ItemsSource = adapters;
-        AdapterSelector.SelectedIndex = adapters.Count > 0 ? 0 : -1;
-        UpdateAdapterSummary();
-        if (adapters.Count == 0)
+        try
         {
-            SetStatus("No active IPv4 adapter with a gateway was found.", false);
-            StartButton.IsEnabled = false;
+            settings = await settingsStore.LoadAsync();
         }
-    }
+        catch (Exception exception) when (
+            exception is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            loadErrors.Add($"Could not load device settings: {exception.Message}");
+        }
 
-    private async Task SaveUsageInBackgroundAsync()
-    {
-        if (usageSaveInProgress)
+        if (closingInProgress)
         {
             return;
         }
 
-        usageSaveInProgress = true;
-        try
+        loadWarning = loadErrors.Count == 0 ? null : string.Join("  ", loadErrors);
+        dataReady = loadWarning is null;
+        registry.RestoreInventory(SavedDeviceInventory.Build(settings, usageTracker.Ledger));
+        LoadDomainRulesFromSettings();
+        SelectedDeviceDetails.IsEnabled = dataReady;
+        DomainRulesSection.IsEnabled = dataReady;
+        if (dataReady)
         {
-            await usageTracker.SaveIfChangedAsync();
+            StartUsagePersistence();
+            domainRefreshTimer.Start();
+            settingsSaveTimer.Start();
         }
-        catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException)
+
+        var adapters = getAdapters();
+        AdapterSelector.ItemsSource = adapters;
+        AdapterSelector.SelectedIndex = adapters.Count > 0 ? 0 : -1;
+        RefreshDevices(null, EventArgs.Empty);
+        UpdateButtons();
+        if (!dataReady)
         {
-            DetailStatusText.Text = $"Could not save usage: {exception.Message}";
+            SetStatus("Monitoring is disabled to protect saved data. Close the app and recover its saved files before retrying.", false);
         }
-        finally
+        else if (adapters.Count == 0)
         {
-            usageSaveInProgress = false;
+            SetStatus("No active IPv4 adapter with a gateway was found.", false);
         }
+        else
+        {
+            SetStatus("Saved devices loaded. Monitoring is stopped.", null);
+        }
+
+        RefreshCaptureDiagnostics();
     }
+
+    private void StartUsagePersistence()
+    {
+        if (usagePersistence is null)
+        {
+            usagePersistence = new UsagePersistenceService(usageTracker, UsageSaveInterval);
+            usagePersistence.SaveFailed += UsagePersistence_OnSaveFailed;
+            usagePersistence.SaveSucceeded += UsagePersistence_OnSaveSucceeded;
+        }
+
+        usagePersistence.Start();
+    }
+
+    private void UsagePersistence_OnSaveFailed(object? sender, string message)
+    {
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            usageSaveWarning = message;
+            DetailStatusText.Text = message;
+            RefreshCaptureDiagnostics();
+        });
+    }
+
+    private void UsagePersistence_OnSaveSucceeded(object? sender, EventArgs eventArgs)
+    {
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            if (usageSaveWarning is null)
+            {
+                return;
+            }
+
+            usageSaveWarning = null;
+            RefreshCaptureDiagnostics();
+        });
+    }
+
+    private async void SettingsSaveTimer_OnTick(object? sender, EventArgs eventArgs) =>
+        await TrySaveSettingsAsync();
 
     /// <summary>
     /// Synchronously records bytes that have not reached a snapshot yet and writes
@@ -166,27 +262,31 @@ public partial class MainWindow : Window
     /// </summary>
     public void SaveUsageNow()
     {
+        if (!dataReady)
+        {
+            return;
+        }
+
         try
         {
             usageTracker.FlushAndSave();
         }
         catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException)
+            exception is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException)
         {
-            // Nothing useful can be shown while the app is exiting; the periodic save
-            // and backup file keep the previous totals.
+            // Shutdown may not allow UI; keep the previous durable copies intact.
         }
     }
 
     private async void StartButton_OnClick(object sender, RoutedEventArgs eventArgs)
     {
-        if (operationInProgress || AdapterSelector.SelectedItem is not AdapterProfile selected)
+        if (!dataReady || closingInProgress || operationInProgress ||
+            AdapterSelector.SelectedItem is not AdapterProfile selected)
         {
             return;
         }
 
-        operationInProgress = true;
-        UpdateButtons();
+        BeginOperation();
         SetStatus("Starting packet capture…", null);
         try
         {
@@ -197,9 +297,9 @@ public partial class MainWindow : Window
             controlStartedAt = DateTimeOffset.UtcNow;
             TrafficChart.Samples = trafficHistory.Samples;
             RefreshDevices(null, EventArgs.Empty);
-            await SaveSettingsIfDirtyAsync();
-            SetStatus("Control active", true);
+            SetStatus("IPv4 control active — displaying observed traffic only.", true);
             refreshTimer.Start();
+            await TrySaveSettingsAsync();
         }
         catch (Exception exception)
         {
@@ -212,8 +312,7 @@ public partial class MainWindow : Window
         }
         finally
         {
-            operationInProgress = false;
-            UpdateButtons();
+            CompleteOperation();
         }
     }
 
@@ -224,22 +323,20 @@ public partial class MainWindow : Window
 
     private async void ScanButton_OnClick(object sender, RoutedEventArgs eventArgs)
     {
-        if (operationInProgress || !engine.IsRunning)
+        if (closingInProgress || operationInProgress || !engine.IsRunning)
         {
             return;
         }
 
-        operationInProgress = true;
-        UpdateButtons();
+        BeginOperation();
         try
         {
             SetStatus("Sending a full /24 ARP sweep…", null);
             UpdateKnownDeviceHints();
             var result = await engine.RefreshNeighborsAsync();
             RefreshDevices(null, EventArgs.Empty);
-            await SaveSettingsIfDirtyAsync();
-            SetStatus("Control active", true);
-            DetailStatusText.Text = result.StatusMessage;
+            SetStatus(result.StatusMessage, true);
+            await TrySaveSettingsAsync();
         }
         catch (Exception exception)
         {
@@ -247,96 +344,119 @@ public partial class MainWindow : Window
         }
         finally
         {
-            operationInProgress = false;
-            UpdateButtons();
+            CompleteOperation();
         }
     }
 
     private void ClearActivityButton_OnClick(object sender, RoutedEventArgs eventArgs)
     {
         ClearObservedActivity();
-        DetailStatusText.Text = "Website activity cleared from this session.";
+        DetailStatusText.Text = "Observed domains cleared from this session; usage totals and saved rules are unchanged.";
     }
 
     private void ClearObservedActivity()
     {
+        domainBuffer.Clear(DateTimeOffset.UtcNow);
+        omittedDomainObservations = 0;
         websiteActivityIndex.Clear();
         WebsiteActivity.Clear();
         websiteActivityGroupIndex.Clear();
         DeviceActivityGroups.Clear();
         RefreshWebsiteActivityState();
+        RefreshCaptureDiagnostics();
     }
 
     private void Engine_OnDeviceDomainObserved(
         object? sender,
         DeviceDomainObservedEventArgs eventArgs)
     {
-        _ = Dispatcher.BeginInvoke(
-            () => ObserveWebsiteActivity(eventArgs),
-            DispatcherPriority.Background);
+        domainBuffer.Add(eventArgs);
     }
 
-    private void ObserveWebsiteActivity(DeviceDomainObservedEventArgs eventArgs)
+    private void DrainDomainObservations(object? sender, EventArgs eventArgs)
     {
-        var macKey = TrafficPolicy.NormalizeMac(eventArgs.MacAddress.ToString());
-        var deviceName = deviceIndex.TryGetValue(macKey, out var device)
-            ? device.DisplayName
-            : $"Device {FormatMac(macKey)}";
+        var batch = domainBuffer.Drain();
+        var omissionChanged = omittedDomainObservations != batch.OmittedObservations;
+        omittedDomainObservations = batch.OmittedObservations;
+        foreach (var observation in batch.Observations)
+        {
+            ObserveWebsiteActivity(observation);
+        }
+
+        if (batch.Observations.Count > 0)
+        {
+            TrimWebsiteActivity();
+            SyncWebsiteActivityGroups();
+        }
+
+        if (batch.Observations.Count > 0 || omissionChanged)
+        {
+            RefreshWebsiteActivityState();
+        }
+
+        if (omissionChanged)
+        {
+            RefreshCaptureDiagnostics();
+        }
+    }
+
+    private void ObserveWebsiteActivity(BufferedDomainObservation observation)
+    {
+        var macKey = TrafficPolicy.NormalizeMac(observation.MacAddress.ToString());
+        var deviceName = ResolveDeviceName(macKey);
+        deviceIndex.TryGetValue(macKey, out var device);
         var ipAddress = device?.IpAddress ?? "-";
         var group = GetOrCreateWebsiteActivityGroup(macKey, deviceName, ipAddress);
-        var domainKey = $"{macKey}|{eventArgs.Observation.Domain}";
-        if (websiteActivityIndex.TryGetValue(domainKey, out var existing))
+        var domainKey = $"{macKey}|{observation.Domain}";
+        var isNew = !websiteActivityIndex.TryGetValue(domainKey, out var activity);
+        if (isNew)
         {
-            existing.Observe(
-                deviceName,
-                ipAddress,
-                eventArgs.Observation.Source,
-                eventArgs.ObservedAt);
-            existing.SetBlocked(
-                eventArgs.Blocked || policy.ShouldBlockDomain(macKey, existing.Domain));
-            group.TouchDomain(existing);
-        }
-        else
-        {
-            var activity = new DeviceActivityViewModel(
+            activity = new DeviceActivityViewModel(
                 macKey,
                 deviceName,
                 ipAddress,
-                eventArgs.Observation.Domain,
-                eventArgs.Observation.Source,
-                eventArgs.ObservedAt);
-            activity.SetBlocked(
-                eventArgs.Blocked || policy.ShouldBlockDomain(macKey, activity.Domain));
+                observation.Domain,
+                observation.Sources[0],
+                observation.FirstSeen);
             websiteActivityIndex[domainKey] = activity;
             WebsiteActivity.Add(activity);
             group.AddDomain(activity);
         }
 
-        while (WebsiteActivity.Count > MaxWebsiteActivityRows)
-        {
-            var oldest = WebsiteActivity.MinBy(activity => activity.LastSeen);
-            if (oldest is null)
-            {
-                break;
-            }
+        activity!.ObserveBatch(
+            deviceName,
+            ipAddress,
+            observation.Sources,
+            observation.FirstSeen,
+            observation.LastSeen,
+            observation.ObservationCount - (isNew ? 1 : 0),
+            observation.LastObservedDrop);
+        activity.SetBlocked(policy.ShouldBlockDomain(macKey, activity.Domain));
+        activity.SetControlAvailable(device?.CanControl == true);
+        group.TouchDomain(activity);
+    }
 
+    private void TrimWebsiteActivity()
+    {
+        foreach (var oldest in WebsiteActivity
+                     .OrderBy(activity => activity.LastSeen)
+                     .Take(Math.Max(0, WebsiteActivity.Count - MaxWebsiteActivityRows))
+                     .ToArray())
+        {
             WebsiteActivity.Remove(oldest);
             websiteActivityIndex.Remove($"{oldest.MacKey}|{oldest.Domain}");
-            if (websiteActivityGroupIndex.TryGetValue(oldest.MacKey, out var oldestGroup))
+            if (websiteActivityGroupIndex.TryGetValue(oldest.MacKey, out var group))
             {
-                oldestGroup.RemoveDomain(oldest);
+                group.RemoveDomain(oldest);
             }
         }
-
-        CollectionViewSource.GetDefaultView(WebsiteActivity).Refresh();
-        RefreshWebsiteActivityState();
     }
 
     private async void BlockVisitedDomainButton_OnClick(
         object sender,
         RoutedEventArgs eventArgs)
     {
-        if (sender is Button { Tag: DeviceActivityViewModel activity })
+        if (sender is Button { Tag: DeviceActivityViewModel { CanBlock: true } activity })
         {
             await AddDomainBlockAsync(activity.MacKey, activity.Domain);
         }
@@ -346,7 +466,7 @@ public partial class MainWindow : Window
     {
         if (DomainRuleDeviceSelector.SelectedItem is not DeviceViewModel { CanControl: true } device)
         {
-            DomainRuleValidationText.Text = "Choose a connected device.";
+            DomainRuleValidationText.Text = "Choose a saved or observed device.";
             DomainRuleValidationText.Visibility = Visibility.Visible;
             return;
         }
@@ -373,7 +493,7 @@ public partial class MainWindow : Window
     {
         if (DomainPresetDeviceSelector.SelectedItem is not DeviceViewModel { CanControl: true } device)
         {
-            DomainPresetValidationText.Text = "Choose a connected device.";
+            DomainPresetValidationText.Text = "Choose a saved or observed device.";
             DomainPresetValidationText.Visibility = Visibility.Visible;
             return;
         }
@@ -438,6 +558,12 @@ public partial class MainWindow : Window
         string status)
     {
         var macKey = TrafficPolicy.NormalizeMac(macAddress);
+        if (!dataReady || !deviceIndex.TryGetValue(macKey, out var device) || !device.CanControl)
+        {
+            DetailStatusText.Text = "IPv4 filtering is unavailable for this device.";
+            return;
+        }
+
         if (!settings.BlockedDomains.TryGetValue(macKey, out var domains))
         {
             domains = [];
@@ -521,16 +647,19 @@ public partial class MainWindow : Window
 
     private async Task SaveDomainRulesAsync(string status)
     {
+        MarkSettingsDirty();
         try
         {
-            await settingsStore.SaveAsync(settings);
-            settingsDirty = false;
+            await SaveSettingsIfDirtyAsync();
             RefreshDomainRulesState();
-            DetailStatusText.Text = status;
+            DetailStatusText.Text = engine.IsRunning
+                ? $"{status} Rules apply only to observed IPv4 traffic."
+                : "IPv4 rule saved; monitoring is stopped.";
         }
-        catch (IOException exception)
+        catch (Exception exception) when (
+            exception is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException)
         {
-            DetailStatusText.Text = exception.Message;
+            ReportSettingsSaveFailure(exception);
         }
     }
 
@@ -589,7 +718,7 @@ public partial class MainWindow : Window
             }
         }
 
-        return $"Device {FormatMac(macKey)}";
+        return "Unknown device";
     }
 
     private void RefreshBlockedActivityState()
@@ -618,8 +747,11 @@ public partial class MainWindow : Window
             ? Visibility.Visible
             : Visibility.Collapsed;
         WebsiteActivityCountText.Text =
-            $"{DeviceActivityGroups.Count} device{(DeviceActivityGroups.Count == 1 ? string.Empty : "s")}  •  " +
-            $"{WebsiteActivity.Count} domain{(WebsiteActivity.Count == 1 ? string.Empty : "s")}";
+            $"{DeviceActivityGroups.Count} device group{(DeviceActivityGroups.Count == 1 ? string.Empty : "s")}  •  " +
+            $"{WebsiteActivity.Count}/{MaxWebsiteActivityRows} retained device/domain pairs — session only" +
+            (omittedDomainObservations > 0
+                ? $"  •  {omittedDomainObservations:N0} observations omitted (buffer full)"
+                : string.Empty);
     }
 
     private DeviceActivityGroupViewModel GetOrCreateWebsiteActivityGroup(
@@ -647,34 +779,39 @@ public partial class MainWindow : Window
 
     private void SyncWebsiteActivityGroups()
     {
-        var connectedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var device in Devices.Where(device => device.CanControl && device.IsOnline))
+        foreach (var group in DeviceActivityGroups.ToArray())
         {
-            connectedKeys.Add(device.MacKey);
-            _ = GetOrCreateWebsiteActivityGroup(
-                device.MacKey,
-                device.DisplayName,
-                device.IpAddress);
-        }
+            if (deviceIndex.TryGetValue(group.MacKey, out var device))
+            {
+                group.UpdateIdentity(device.DisplayName, device.IpAddress);
+                foreach (var activity in group.Domains)
+                {
+                    activity.ObserveBatch(
+                        device.DisplayName,
+                        device.IpAddress,
+                        [],
+                        activity.FirstSeen,
+                        activity.LastSeen,
+                        0,
+                        activity.LastObservedDrop);
+                    activity.SetControlAvailable(device.CanControl);
+                }
+            }
 
-        foreach (var group in DeviceActivityGroups
-                     .Where(group => !connectedKeys.Contains(group.MacKey))
-                     .ToArray())
-        {
-            DeviceActivityGroups.Remove(group);
+            if (!group.HasDomains)
+            {
+                DeviceActivityGroups.Remove(group);
+                websiteActivityGroupIndex.Remove(group.MacKey);
+            }
         }
 
         RefreshWebsiteActivityState();
     }
 
-    private void SyncDomainRuleDevices()
+    private void SyncDomainRuleDevices(bool refreshOrdering = false)
     {
-        var available = Devices
-            .Where(device => device.CanControl && device.IsOnline)
-            .ToArray();
-        foreach (var stale in DomainRuleDevices
-                     .Where(device => !available.Contains(device))
-                     .ToArray())
+        var available = Devices.Where(device => device.CanControl).ToHashSet();
+        foreach (var stale in DomainRuleDevices.Where(device => !available.Contains(device)).ToArray())
         {
             DomainRuleDevices.Remove(stale);
         }
@@ -685,18 +822,16 @@ public partial class MainWindow : Window
             {
                 DomainRuleDevices.Add(device);
             }
+        }
 
-            foreach (var rule in DomainRules.Where(rule =>
-                         rule.MacKey.Equals(device.MacKey, StringComparison.OrdinalIgnoreCase)))
-            {
-                rule.UpdateDeviceName(device.DisplayName);
-            }
+        foreach (var rule in DomainRules)
+        {
+            rule.UpdateDeviceName(ResolveDeviceName(rule.MacKey));
+        }
 
-            foreach (var preset in DomainPresetRules.Where(preset =>
-                         preset.MacKey.Equals(device.MacKey, StringComparison.OrdinalIgnoreCase)))
-            {
-                preset.UpdateDeviceName(device.DisplayName);
-            }
+        foreach (var preset in DomainPresetRules)
+        {
+            preset.UpdateDeviceName(ResolveDeviceName(preset.MacKey));
         }
 
         if (DomainRuleDeviceSelector.SelectedItem is null && DomainRuleDevices.Count > 0)
@@ -709,45 +844,85 @@ public partial class MainWindow : Window
             DomainPresetDeviceSelector.SelectedIndex = 0;
         }
 
-        CollectionViewSource.GetDefaultView(DomainRuleDevices).Refresh();
-        CollectionViewSource.GetDefaultView(DomainPresetRules).Refresh();
-        CollectionViewSource.GetDefaultView(DomainRules).Refresh();
+        if (refreshOrdering)
+        {
+            CollectionViewSource.GetDefaultView(DomainRuleDevices).Refresh();
+            CollectionViewSource.GetDefaultView(DomainPresetRules).Refresh();
+            CollectionViewSource.GetDefaultView(DomainRules).Refresh();
+            CollectionViewSource.GetDefaultView(DeviceActivityGroups).Refresh();
+        }
     }
 
     private void AdapterSelector_OnSelectionChanged(object sender, SelectionChangedEventArgs eventArgs)
     {
         UpdateAdapterSummary();
-        StartButton.IsEnabled = !operationInProgress &&
-                                !engine.IsRunning &&
-                                AdapterSelector.SelectedItem is AdapterProfile;
-    }
-
-    private async Task StopEngineAsync()
-    {
-        if (operationInProgress)
+        if (engine is null)
         {
             return;
         }
 
-        operationInProgress = true;
-        refreshTimer.Stop();
+        if (!engine.IsRunning && AdapterSelector.SelectedItem is AdapterProfile selected)
+        {
+            registry.Remember(selected.LocalAddress, selected.LocalMac, DateTimeOffset.MinValue, Dns.GetHostName());
+            registry.SetHostName(selected.LocalMac, Dns.GetHostName());
+            RefreshDevices(null, EventArgs.Empty);
+        }
+
         UpdateButtons();
-        SetStatus("Restoring normal ARP mappings…", null);
+    }
+
+    private void BeginOperation()
+    {
+        operationInProgress = true;
+        operationCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        UpdateButtons();
+    }
+
+    private void CompleteOperation()
+    {
+        operationInProgress = false;
+        var completion = operationCompletion;
+        operationCompletion = null;
+        UpdateButtons();
+        completion?.TrySetResult(true);
+    }
+
+    private async Task StopEngineAsync()
+    {
+        if (operationInProgress || !engine.IsRunning)
+        {
+            return;
+        }
+
+        BeginOperation();
+        refreshTimer.Stop();
+        SetStatus("Attempting to restore normal ARP mappings…", null);
         try
         {
             await engine.StopAsync();
+            registry.BeginSession();
             RefreshDevices(null, EventArgs.Empty);
-            lastUsageSaveAttempt = DateTimeOffset.UtcNow;
-            SaveUsageNow();
-            await SaveSettingsIfDirtyAsync();
+            DrainDomainObservations(null, EventArgs.Empty);
             controlStartedAt = null;
             UptimeText.Text = "Idle";
-            SetStatus("Stopped safely", null);
+            SetStatus(engine.LastStopStatus, null);
+            try
+            {
+                await usageTracker.FlushAndSaveAsync();
+                usageSaveWarning = null;
+            }
+            catch (Exception exception) when (
+                exception is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException)
+            {
+                usageSaveWarning = $"Could not save usage: {exception.Message}";
+            }
+
+            await TrySaveSettingsAsync();
+            RefreshCaptureDiagnostics();
         }
         finally
         {
-            operationInProgress = false;
-            UpdateButtons();
+            CompleteOperation();
         }
     }
 
@@ -761,38 +936,19 @@ public partial class MainWindow : Window
             Keyboard.FocusedElement is TextBox,
             editableView?.IsAddingNew == true,
             editableView?.IsEditingItem == true);
-        var visibleKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var snapshot in registry.TakeSnapshot(now))
         {
-            if (activeProfile is not null &&
-                (snapshot.IpAddress.Equals(activeProfile.LocalAddress) ||
-                 snapshot.MacAddress.Equals(activeProfile.LocalMac)))
-            {
-                continue;
-            }
-
             var key = snapshot.MacAddress.ToString();
             settings.Devices.TryGetValue(key, out var preferences);
-            var isGateway = activeProfile is not null &&
-                            snapshot.IpAddress.Equals(activeProfile.GatewayAddress);
-            var presence = isGateway
-                ? DevicePresence.Online
-                : DevicePresencePolicy.Classify(snapshot.LastSeen, now);
-            if (presence == DevicePresence.Hidden)
-            {
-                continue;
-            }
-
-            visibleKeys.Add(key);
-            if (!isGateway)
+            var isLocalComputer = activeProfile is not null && snapshot.MacAddress.Equals(activeProfile.LocalMac);
+            var isGateway = !isLocalComputer && engine.IsGatewayMac(snapshot.MacAddress);
+            var protectedReason = isLocalComputer
+                ? "This computer — protected"
+                : isGateway ? "Gateway — protected" : string.Empty;
+            if (dataReady && !isGateway)
             {
                 preferences ??= settings.Devices[key] = new DevicePreferences();
-                var currentIp = snapshot.IpAddress.ToString();
-                if (!string.Equals(preferences.LastKnownIp, currentIp, StringComparison.Ordinal))
-                {
-                    preferences.LastKnownIp = currentIp;
-                    settingsDirty = true;
-                }
+                UpdateRememberedMetadata(snapshot, preferences, isLocalComputer);
             }
 
             if (!deviceIndex.TryGetValue(key, out var viewModel))
@@ -803,51 +959,81 @@ public partial class MainWindow : Window
                 }
 
                 viewModel = new DeviceViewModel(OnDeviceRuleChangedAsync);
-                viewModel.Initialize(
-                    snapshot,
-                    preferences,
-                    isGateway,
-                    isGateway ? "Gateway — protected" : "Online");
+                viewModel.Initialize(snapshot, preferences, isLocalComputer || isGateway, protectedReason);
                 deviceIndex[key] = viewModel;
                 Devices.Add(viewModel);
-            }
-            else
-            {
-                viewModel.Update(snapshot, preferences?.Alias);
+                deviceOrderingDirty = true;
             }
 
-            viewModel.SetPresence(presence == DevicePresence.Online);
+            var previousName = viewModel.DisplayName;
+            var previouslyProtected = viewModel.IsProtected;
+            viewModel.SetProtection(isLocalComputer || isGateway, protectedReason);
+            viewModel.SetMonitoring(engine.IsRunning);
+            viewModel.Update(snapshot, preferences?.Alias);
+            viewModel.SetPresence(
+                engine.IsRunning && !snapshot.IsRemembered &&
+                DevicePresencePolicy.Classify(snapshot.LastSeen, now) == DevicePresence.Online);
+            var coverage = engine.GetCoverage(snapshot.MacAddress);
+            viewModel.SetCaptureCoverage(isGateway
+                ? "Gateway — protected and not metered as a client. Saved values, if any, are historical observations."
+                : $"{(engine.IsRunning ? "Current" : "Last")} capture session: " +
+                  $"↑ {coverage.UploadPackets:N0} packets ({DeviceViewModel.FormatExactBytes(coverage.UploadPayloadBytes)} payload), " +
+                  $"↓ {coverage.DownloadPackets:N0} packets ({DeviceViewModel.FormatExactBytes(coverage.DownloadPayloadBytes)} payload). " +
+                  coverage.Status);
+            deviceOrderingDirty |= previouslyProtected != viewModel.IsProtected ||
+                                   !string.Equals(previousName, viewModel.DisplayName, StringComparison.Ordinal);
         }
 
-        if (canMutateView)
+        var refreshOrdering = canMutateView && deviceOrderingDirty;
+        if (refreshOrdering)
         {
-            foreach (var stale in Devices
-                         .Where(device => !visibleKeys.Contains(device.MacKey))
-                         .ToArray())
-            {
-                deviceIndex.Remove(stale.MacKey);
-                Devices.Remove(stale);
-            }
-
             view.Refresh();
-        }
-
-        if (now - lastUsageSaveAttempt >= UsageSaveInterval)
-        {
-            lastUsageSaveAttempt = now;
-            _ = SaveUsageInBackgroundAsync();
+            deviceOrderingDirty = false;
         }
 
         SyncWebsiteActivityGroups();
-        SyncDomainRuleDevices();
+        SyncDomainRuleDevices(refreshOrdering);
         RefreshDashboardSummary();
+        RefreshCaptureDiagnostics();
         EmptyState.Visibility = Devices.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        DeviceCountText.Text = $"{Devices.Count} device{(Devices.Count == 1 ? string.Empty : "s")}";
+        DeviceCountText.Text = $"{Devices.Count} saved or observed device{(Devices.Count == 1 ? string.Empty : "s")}";
+    }
+
+    private void UpdateRememberedMetadata(
+        DeviceSnapshot snapshot,
+        DevicePreferences preferences,
+        bool isLocalComputer)
+    {
+        var newerObservation = snapshot.LastSeen != DateTimeOffset.MinValue &&
+                               (preferences.LastSeenUtc is null || snapshot.LastSeen > preferences.LastSeenUtc);
+        if ((!snapshot.IsRemembered || newerObservation || isLocalComputer) &&
+            snapshot.IpAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
+            !snapshot.IpAddress.Equals(IPAddress.Any))
+        {
+            var currentIp = snapshot.IpAddress.ToString();
+            if (!string.Equals(preferences.LastKnownIp, currentIp, StringComparison.Ordinal))
+            {
+                preferences.LastKnownIp = currentIp;
+                MarkSettingsDirty();
+            }
+        }
+
+        if (newerObservation)
+        {
+            preferences.LastSeenUtc = snapshot.LastSeen.ToUniversalTime();
+            MarkSettingsDirty();
+        }
+
+        if (isLocalComputer && !string.Equals(preferences.LearnedHostName, snapshot.HostName, StringComparison.Ordinal))
+        {
+            preferences.LearnedHostName = snapshot.HostName;
+            MarkSettingsDirty();
+        }
     }
 
     private async Task OnDeviceRuleChangedAsync(DeviceViewModel device)
     {
-        if (!device.CanControl)
+        if (!dataReady || closingInProgress || !device.CanRename)
         {
             return;
         }
@@ -855,56 +1041,74 @@ public partial class MainWindow : Window
         var preferences = settings.Devices.TryGetValue(device.MacKey, out var existing)
             ? existing
             : settings.Devices[device.MacKey] = new DevicePreferences();
-        var rule = new TrafficRule(
-                device.PauseInternet,
-                device.DownloadLimit,
-                device.UploadLimit)
+        var rule = new TrafficRule(device.PauseInternet, device.DownloadLimit, device.UploadLimit)
             .ForForwardingMode();
-        var ruleChanged =
-            preferences.DownloadKiloBytesPerSecond != rule.DownloadKiloBytesPerSecond ||
-            preferences.UploadKiloBytesPerSecond != rule.UploadKiloBytesPerSecond ||
-            preferences.PauseInternet != rule.PauseInternet;
-        var aliasChanged = !string.Equals(
-            preferences.Alias,
-            device.Alias,
-            StringComparison.Ordinal);
-        preferences.DownloadKiloBytesPerSecond = rule.DownloadKiloBytesPerSecond;
-        preferences.UploadKiloBytesPerSecond = rule.UploadKiloBytesPerSecond;
-        preferences.PauseInternet = rule.PauseInternet;
-        preferences.Alias = device.Alias;
-
-        try
+        var ruleChanged = device.CanControl &&
+            (preferences.DownloadKiloBytesPerSecond != rule.DownloadKiloBytesPerSecond ||
+             preferences.UploadKiloBytesPerSecond != rule.UploadKiloBytesPerSecond ||
+             preferences.PauseInternet != rule.PauseInternet);
+        var aliasChanged = !string.Equals(preferences.Alias, device.Alias, StringComparison.Ordinal);
+        if (!ruleChanged && !aliasChanged)
         {
-            if (ruleChanged)
+            return;
+        }
+
+        if (device.CanControl)
+        {
+            preferences.DownloadKiloBytesPerSecond = rule.DownloadKiloBytesPerSecond;
+            preferences.UploadKiloBytesPerSecond = rule.UploadKiloBytesPerSecond;
+            preferences.PauseInternet = rule.PauseInternet;
+        }
+
+        preferences.Alias = device.Alias;
+        MarkSettingsDirty();
+        deviceOrderingDirty |= aliasChanged;
+        SyncWebsiteActivityGroups();
+        SyncDomainRuleDevices();
+        string? ruleWarning = null;
+        if (ruleChanged)
+        {
+            try
             {
                 await engine.ApplyRuleAsync(device.MacKey, rule);
             }
+            catch (Exception exception) when (
+                exception is IOException or InvalidOperationException)
+            {
+                ruleWarning = $"Could not confirm IPv4 policy activation: {exception.Message}";
+            }
+        }
 
-            await settingsStore.SaveAsync(settings);
-            settingsDirty = false;
-            await Dispatcher.InvokeAsync(
-                () =>
-                {
-                    DetailStatusText.Text =
-                        aliasChanged && !ruleChanged
-                            ? $"Device renamed to {device.DisplayName}."
-                            : engine.IsRunning
-                            ? $"Rule applied to {device.DisplayName}."
-                            : $"Rule saved for {device.DisplayName}; it activates when control starts.";
-                    RefreshDashboardSummary(addTrafficSample: false);
-                });
+        try
+        {
+            await SaveSettingsIfDirtyAsync();
+            DetailStatusText.Text = ruleWarning ??
+                (aliasChanged && !ruleChanged
+                    ? $"Device name saved: {device.DisplayName}."
+                    : engine.IsRunning
+                        ? $"IPv4 policy configured for {device.DisplayName}; unobserved traffic is outside its scope."
+                        : $"IPv4 policy saved for {device.DisplayName}; monitoring is stopped.");
         }
         catch (Exception exception) when (
-            exception is IOException or InvalidOperationException)
+            exception is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException)
         {
-            await Dispatcher.InvokeAsync(() => DetailStatusText.Text = exception.Message);
+            ReportSettingsSaveFailure(exception);
         }
+
+        RefreshDashboardSummary(addTrafficSample: false);
     }
 
     private void ApplyAllSavedRules()
     {
+        var localMac = (AdapterSelector.SelectedItem as AdapterProfile)?.LocalMac.ToString();
         foreach (var pair in settings.Devices)
         {
+            if (string.Equals(pair.Key, localMac, StringComparison.OrdinalIgnoreCase))
+            {
+                policy.RemoveRule(pair.Key);
+                continue;
+            }
+
             policy.SetRule(
                 pair.Key,
                 new TrafficRule(
@@ -923,19 +1127,55 @@ public partial class MainWindow : Window
     private void UpdateKnownDeviceHints()
     {
         engine.ReplaceKnownDeviceHints(KnownDeviceHintFactory.Build(settings));
-        engine.ReplaceRejectedResolvedNames(
-            KnownDeviceHintFactory.FindAmbiguousLearnedNames(settings));
     }
+
+    private void MarkSettingsDirty() => settingsRevision++;
 
     private async Task SaveSettingsIfDirtyAsync()
     {
-        if (!settingsDirty)
+        if (!dataReady || settingsRevision == savedSettingsRevision)
         {
             return;
         }
 
-        await settingsStore.SaveAsync(settings);
-        settingsDirty = false;
+        await settingsSaveSync.WaitAsync();
+        try
+        {
+            if (settingsRevision == savedSettingsRevision)
+            {
+                return;
+            }
+
+            var revision = settingsRevision;
+            await settingsStore.SaveAsync(settings);
+            savedSettingsRevision = revision;
+            settingsSaveWarning = null;
+            RefreshCaptureDiagnostics();
+        }
+        finally
+        {
+            settingsSaveSync.Release();
+        }
+    }
+
+    private async Task TrySaveSettingsAsync()
+    {
+        try
+        {
+            await SaveSettingsIfDirtyAsync();
+        }
+        catch (Exception exception) when (
+            exception is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            ReportSettingsSaveFailure(exception);
+        }
+    }
+
+    private void ReportSettingsSaveFailure(Exception exception)
+    {
+        settingsSaveWarning = $"Could not save device settings: {exception.Message}";
+        DetailStatusText.Text = settingsSaveWarning;
+        RefreshCaptureDiagnostics();
     }
 
     private void Engine_OnStatusChanged(object? sender, string message)
@@ -966,15 +1206,24 @@ public partial class MainWindow : Window
         else
         {
             refreshTimer.Stop();
-            SaveUsageNow();
             controlStartedAt = null;
             UptimeText.Text = "Idle";
             TopStatusText.Text = "Idle";
             StatusDot.Fill = new SolidColorBrush(Color.FromRgb(168, 144, 149));
         }
 
+        foreach (var device in Devices)
+        {
+            device.SetMonitoring(isRunning);
+            if (!isRunning)
+            {
+                device.SetPresence(false);
+            }
+        }
+
         UpdateButtons();
         RefreshDashboardSummary(addTrafficSample: false);
+        RefreshCaptureDiagnostics();
     }
 
     private void Engine_OnDeviceIdentityLearned(
@@ -993,37 +1242,25 @@ public partial class MainWindow : Window
         await identitySaveSync.WaitAsync();
         try
         {
-            var lastKnownIp = registry.Peek()
-                .FirstOrDefault(device => device.MacAddress.Equals(eventArgs.MacAddress))?
-                .IpAddress
-                .ToString();
-            var identity = DeviceIdentityTracker.Learn(
+            if (!dataReady || closingInProgress || !engine.IsIdentityCurrent(eventArgs))
+            {
+                return;
+            }
+
+            DeviceIdentityTracker.Learn(
                 settings,
                 eventArgs.MacAddress.ToString(),
                 eventArgs.HostName,
-                lastKnownIp);
-            if (identity.PreviousMacKey is not null)
-            {
-                policy.RemoveRule(identity.PreviousMacKey);
-            }
-
-            var rule = new TrafficRule(
-                    identity.Preferences.PauseInternet,
-                    identity.Preferences.DownloadKiloBytesPerSecond,
-                    identity.Preferences.UploadKiloBytesPerSecond)
-                .ForForwardingMode();
-            await engine.ApplyRuleAsync(identity.MacKey, rule);
+                eventArgs.Address?.ToString());
+            MarkSettingsDirty();
             UpdateKnownDeviceHints();
-            await settingsStore.SaveAsync(settings);
-            settingsDirty = false;
-            DetailStatusText.Text = identity.PreviousMacKey is null
-                ? $"Remembered {eventArgs.HostName}."
-                : $"Recognized {eventArgs.HostName} after its private MAC changed.";
+            await SaveSettingsIfDirtyAsync();
+            DetailStatusText.Text = $"Automatic name remembered: {eventArgs.HostName}. Manual names and policies are unchanged.";
         }
         catch (Exception exception) when (
-            exception is IOException or InvalidOperationException)
+            exception is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException)
         {
-            DetailStatusText.Text = exception.Message;
+            ReportSettingsSaveFailure(exception);
         }
         finally
         {
@@ -1033,34 +1270,129 @@ public partial class MainWindow : Window
 
     private async void MainWindow_OnClosing(object? sender, CancelEventArgs eventArgs)
     {
-        if (closeAfterStop || !engine.IsRunning)
+        if (closeAfterStop)
         {
             SaveUsageNow();
             return;
         }
 
+        if (!engine.IsRunning && usagePersistence is null && !dataReady && !operationInProgress)
+        {
+            closingInProgress = true;
+            refreshTimer.Stop();
+            domainRefreshTimer.Stop();
+            settingsSaveTimer.Stop();
+            return;
+        }
+
         eventArgs.Cancel = true;
+        if (closingInProgress)
+        {
+            return;
+        }
+
+        CommitPendingDeviceEdits();
+        closingInProgress = true;
         IsEnabled = false;
+        await System.Windows.Threading.Dispatcher.Yield(DispatcherPriority.Background);
         try
         {
+            await (operationCompletion?.Task ?? Task.CompletedTask);
             await StopEngineAsync();
+            refreshTimer.Stop();
+            domainRefreshTimer.Stop();
+            settingsSaveTimer.Stop();
+            if (usagePersistence is not null)
+            {
+                await usagePersistence.StopAsync();
+            }
+
+            await SaveSettingsIfDirtyAsync();
+            if (dataReady)
+            {
+                await usageTracker.FlushAndSaveAsync();
+                usageSaveWarning = null;
+            }
+
             await engine.DisposeAsync();
+            if (usagePersistence is { } persistence)
+            {
+                usagePersistence = null;
+                await persistence.DisposeAsync();
+            }
         }
-        finally
+        catch (Exception exception)
         {
-            closeAfterStop = true;
-            Close();
+            var exit = MessageBox.Show(
+                $"Closing could not finish normally: {exception.Message}\n\n" +
+                "The last successful saved files are retained. Close anyway? " +
+                "Choose No to keep the app open and retry saving or Stop & restore.",
+                "Usage Meter",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning,
+                MessageBoxResult.No);
+            if (exit != MessageBoxResult.Yes)
+            {
+                closingInProgress = false;
+                IsEnabled = true;
+                if (dataReady)
+                {
+                    StartUsagePersistence();
+                    domainRefreshTimer.Start();
+                    settingsSaveTimer.Start();
+                    if (engine.IsRunning)
+                    {
+                        refreshTimer.Start();
+                    }
+                }
+
+                SetStatus(exception.Message, false);
+                UpdateButtons();
+                return;
+            }
+
+            try
+            {
+                await engine.DisposeAsync();
+            }
+            catch (Exception)
+            {
+                // The user explicitly chose to close despite the cleanup failure.
+            }
+
+            if (usagePersistence is { } persistence)
+            {
+                usagePersistence = null;
+                try
+                {
+                    await persistence.DisposeAsync();
+                }
+                catch (Exception)
+                {
+                    // Forced close must not strand a disabled window.
+                }
+            }
         }
+
+        closeAfterStop = true;
+        Close();
+    }
+
+    private void CommitPendingDeviceEdits()
+    {
+        DeviceNameEditor.GetBindingExpression(TextBox.TextProperty)?.UpdateSource();
+        DownloadLimitEditor.GetBindingExpression(TextBox.TextProperty)?.UpdateSource();
+        UploadLimitEditor.GetBindingExpression(TextBox.TextProperty)?.UpdateSource();
     }
 
     private void UpdateButtons()
     {
-        StartButton.IsEnabled = !operationInProgress &&
+        StartButton.IsEnabled = dataReady && !closingInProgress && !operationInProgress &&
                                 !engine.IsRunning &&
                                 AdapterSelector.SelectedItem is AdapterProfile;
-        StopButton.IsEnabled = !operationInProgress && engine.IsRunning;
-        ScanButton.IsEnabled = !operationInProgress && engine.IsRunning;
-        AdapterSelector.IsEnabled = !operationInProgress && !engine.IsRunning;
+        StopButton.IsEnabled = !closingInProgress && !operationInProgress && engine.IsRunning;
+        ScanButton.IsEnabled = !closingInProgress && !operationInProgress && engine.IsRunning;
+        AdapterSelector.IsEnabled = !closingInProgress && !operationInProgress && !engine.IsRunning;
         StartButton.Visibility = engine.IsRunning ? Visibility.Collapsed : Visibility.Visible;
         ScanButton.Visibility = engine.IsRunning ? Visibility.Visible : Visibility.Collapsed;
         StopButton.Visibility = engine.IsRunning ? Visibility.Visible : Visibility.Collapsed;
@@ -1091,22 +1423,32 @@ public partial class MainWindow : Window
             return;
         }
 
-        SetVisiblePage(target);
-        MainScrollViewer.ScrollToTop();
-        if (target == OverviewSection)
+        var pageName = target == AdapterStrip ? OverviewSection.Name : target.Name;
+        if (!string.Equals(currentPageName, pageName, StringComparison.Ordinal))
         {
-            target.BringIntoView();
+            pageScrollOffsets[currentPageName] = MainScrollViewer.VerticalOffset;
+            currentPageName = pageName;
+            SetVisiblePage(target);
+            var offset = pageScrollOffsets.GetValueOrDefault(pageName);
+            _ = Dispatcher.InvokeAsync(() =>
+            {
+                if (string.Equals(currentPageName, pageName, StringComparison.Ordinal))
+                {
+                    MainScrollViewer.ScrollToVerticalOffset(offset);
+                }
+            }, DispatcherPriority.Loaded);
         }
 
         if (target == AdapterStrip)
         {
             AdapterSelector.Focus();
+            AdapterStrip.BringIntoView();
         }
     }
 
     private void SetVisiblePage(FrameworkElement target)
     {
-        var showOverview = target == OverviewSection;
+        var showOverview = target == OverviewSection || target == AdapterStrip;
         var overviewVisibility = showOverview ? Visibility.Visible : Visibility.Collapsed;
         OverviewSection.Visibility = overviewVisibility;
         AdapterStrip.Visibility = overviewVisibility;
@@ -1138,8 +1480,8 @@ public partial class MainWindow : Window
     {
         var summary = DashboardSummary.From(Devices);
         ConnectedDevicesMetric.Text = summary.ConnectedDevices.ToString();
-        DownloadMetric.Text = DeviceViewModel.FormatRate(summary.DownloadBytesPerSecond);
-        UploadMetric.Text = DeviceViewModel.FormatRate(summary.UploadBytesPerSecond);
+        DownloadMetric.Text = engine.IsRunning ? DeviceViewModel.FormatRate(summary.DownloadBytesPerSecond) : "—";
+        UploadMetric.Text = engine.IsRunning ? DeviceViewModel.FormatRate(summary.UploadBytesPerSecond) : "—";
         ActiveRulesMetric.Text = summary.ActiveRules.ToString();
 
         if (addTrafficSample && engine.IsRunning)
@@ -1159,10 +1501,18 @@ public partial class MainWindow : Window
         }
     }
 
-    private static string FormatMac(string macKey) =>
-        string.Join(
-            ":",
-            Enumerable.Range(0, 6).Select(index => macKey.Substring(index * 2, 2)));
+    private void RefreshCaptureDiagnostics()
+    {
+        var warnings = new[] { loadWarning, usageSaveWarning, settingsSaveWarning }
+            .Where(message => !string.IsNullOrWhiteSpace(message));
+        var warningText = string.Join("  ", warnings);
+        var omissionText = omittedDomainObservations > 0
+            ? $"Domain display buffer omitted {omittedDomainObservations:N0} observations; usage counters are independent.  "
+            : string.Empty;
+        SavedDataWarningText.Text = warningText.Length > 0 ? $"Saved-data warning: {warningText}" : string.Empty;
+        SavedDataWarningText.Visibility = warningText.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        CaptureDiagnosticsText.Text = omissionText + engine.GetDiagnosticsSummary();
+    }
 
     private void SetStatus(string message, bool? active)
     {

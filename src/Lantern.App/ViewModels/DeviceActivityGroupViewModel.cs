@@ -45,14 +45,16 @@ public sealed class DeviceActivityGroupViewModel : INotifyPropertyChanged
 
     public string DomainCountText => Domains.Count switch
     {
-        0 => "No domains yet",
-        1 => "1 domain",
-        _ => $"{Domains.Count} domains",
+        0 => "No observed domains",
+        1 => "1 observed domain",
+        _ => $"{Domains.Count} observed domains",
     };
 
+    public long ObservationCount => Domains.Sum(activity => (long)activity.ObservationCount);
+
     public string LastSeenText => Domains.Count == 0
-        ? "Waiting for activity"
-        : $"Last seen {Domains.Max(activity => activity.LastSeen).ToLocalTime():HH:mm:ss}";
+        ? "No observations yet"
+        : $"Last observed {Domains.Max(activity => activity.LastSeen).ToLocalTime():HH:mm:ss}";
 
     public void UpdateIdentity(string latestDeviceName, string latestIpAddress)
     {
@@ -63,20 +65,22 @@ public sealed class DeviceActivityGroupViewModel : INotifyPropertyChanged
     public void AddDomain(DeviceActivityViewModel activity)
     {
         ArgumentNullException.ThrowIfNull(activity);
-        Domains.Insert(0, activity);
+        if (Domains.Contains(activity))
+        {
+            return;
+        }
+
+        Domains.Add(activity);
         RaiseDomainSummaryChanged();
     }
 
     public void TouchDomain(DeviceActivityViewModel activity)
     {
         ArgumentNullException.ThrowIfNull(activity);
-        var index = Domains.IndexOf(activity);
-        if (index > 0)
+        if (Domains.Contains(activity))
         {
-            Domains.Move(index, 0);
+            RaiseDomainSummaryChanged();
         }
-
-        RaiseDomainSummaryChanged();
     }
 
     public void RemoveDomain(DeviceActivityViewModel activity)
@@ -103,6 +107,7 @@ public sealed class DeviceActivityGroupViewModel : INotifyPropertyChanged
     {
         OnPropertyChanged(nameof(HasDomains));
         OnPropertyChanged(nameof(DomainCountText));
+        OnPropertyChanged(nameof(ObservationCount));
         OnPropertyChanged(nameof(LastSeenText));
     }
 

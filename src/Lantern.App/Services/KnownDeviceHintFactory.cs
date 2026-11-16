@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using Lantern.Core.Settings;
 
 namespace Lantern.App.Services;
@@ -9,23 +10,21 @@ public static class KnownDeviceHintFactory
     public static IReadOnlyList<KnownDeviceHint> Build(AppSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
-        var ambiguousNames = FindAmbiguousLearnedNames(settings);
         var hints = new List<KnownDeviceHint>();
         foreach (var pair in settings.Devices)
         {
-            if (!PhysicalAddress.TryParse(pair.Key, out var macAddress))
+            if (!PhysicalAddress.TryParse(pair.Key, out var macAddress) ||
+                macAddress.GetAddressBytes().Length != 6)
             {
                 continue;
             }
 
-            IPAddress.TryParse(pair.Value.LastKnownIp, out var lastKnownIp);
-            var alias = Normalize(pair.Value.Alias);
+            var lastKnownIp = IPAddress.TryParse(pair.Value.LastKnownIp, out var address) &&
+                              address.AddressFamily == AddressFamily.InterNetwork
+                ? address
+                : null;
             var learnedName = Normalize(pair.Value.LearnedHostName);
-            var hostName = alias ??
-                           (learnedName is not null && !ambiguousNames.Contains(learnedName)
-                               ? learnedName
-                               : null);
-            hints.Add(new KnownDeviceHint(macAddress, lastKnownIp, hostName));
+            hints.Add(new KnownDeviceHint(macAddress, lastKnownIp, learnedName));
         }
 
         return hints;

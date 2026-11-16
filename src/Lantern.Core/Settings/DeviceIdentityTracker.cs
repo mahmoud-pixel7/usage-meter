@@ -23,26 +23,6 @@ public static class DeviceIdentityTracker
         var normalizedIp = NormalizeIpv4(lastKnownIp);
         settings.Devices.TryGetValue(macKey, out var current);
 
-        var matches = settings.Devices
-            .Where(pair =>
-                !string.Equals(pair.Key, macKey, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(
-                    pair.Value.LearnedHostName,
-                    normalizedHostName,
-                    StringComparison.OrdinalIgnoreCase))
-            .ToArray();
-        if (matches.Length == 1 && CanReplaceWithMigratedProfile(current))
-        {
-            var previous = matches[0];
-            settings.Devices.Remove(previous.Key);
-            settings.Devices.Remove(macKey);
-            previous.Value.LearnedHostName = normalizedHostName;
-            previous.Value.LastKnownIp =
-                normalizedIp ?? current?.LastKnownIp ?? previous.Value.LastKnownIp;
-            settings.Devices[macKey] = previous.Value;
-            return new DeviceIdentityResult(macKey, previous.Key, previous.Value);
-        }
-
         current ??= settings.Devices[macKey] = new DevicePreferences();
         current.LearnedHostName = normalizedHostName;
         if (normalizedIp is not null)
@@ -52,14 +32,6 @@ public static class DeviceIdentityTracker
 
         return new DeviceIdentityResult(macKey, null, current);
     }
-
-    private static bool CanReplaceWithMigratedProfile(DevicePreferences? current) =>
-        current is null ||
-        (string.IsNullOrWhiteSpace(current.Alias) &&
-         string.IsNullOrWhiteSpace(current.LearnedHostName) &&
-         current.DownloadKiloBytesPerSecond == 0 &&
-         current.UploadKiloBytesPerSecond == 0 &&
-         !current.PauseInternet);
 
     private static string NormalizeHostName(string value)
     {

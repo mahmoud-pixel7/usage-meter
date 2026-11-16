@@ -269,18 +269,24 @@ public sealed class TrafficControlTests
     }
 
     [Fact]
-    public void DeviceRegistry_BeginSessionRemovesStaleNamesAndAddresses()
+    public void DeviceRegistry_BeginSessionRetainsOfflineInventoryWithoutClaimingLiveness()
     {
         var registry = new DeviceRegistry();
+        var seenAt = DateTimeOffset.Parse("2026-11-15T10:00:00Z");
         registry.Observe(
             IPAddress.Parse("192.168.31.213"),
             PhysicalAddress.Parse("0E4F69CCE4F0"),
-            DateTimeOffset.UtcNow,
+            seenAt,
             "Humane");
 
         registry.BeginSession();
 
-        Assert.Empty(registry.Peek());
+        var remembered = Assert.Single(registry.Peek());
+        Assert.True(remembered.IsRemembered);
+        Assert.Equal(seenAt, remembered.LastSeen);
+        Assert.Equal("Humane", remembered.HostName);
+        Assert.Equal(IPAddress.Parse("192.168.31.213"), remembered.IpAddress);
+        Assert.Equal(0, remembered.TotalBytesPerSecond);
     }
 
     private sealed class ManualClock

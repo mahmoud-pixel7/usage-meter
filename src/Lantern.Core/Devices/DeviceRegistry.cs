@@ -24,35 +24,113 @@ public sealed class DeviceRegistry
     /// </summary>
     public UsageLedger Usage { get; }
 
-    public void BeginSession()
+    public void BeginSession(DateTimeOffset? startedAt = null)
     {
         lock (snapshotSync)
         {
-            DrainPendingBytes();
-            devices.Clear();
-            lastSnapshot = DateTimeOffset.UtcNow;
+            foreach (var (key, record) in devices)
+            {
+                lock (record.Sync)
+                {
+                    DrainPendingBytes(key, record);
+                    record.RateDownloadBytes = 0;
+                    record.RateUploadBytes = 0;
+                    record.IsRemembered = true;
+                }
+            }
+
+            lastSnapshot = startedAt ?? DateTimeOffset.UtcNow;
         }
     }
 
+    public void RestoreInventory(IEnumerable<DeviceSnapshot> remembered)
+    {
+        ArgumentNullException.ThrowIfNull(remembered);
+        foreach (var snapshot in remembered)
+        {
+            if (!IsDeviceMac(snapshot.MacAddress))
+            {
+                continue;
+            }
+
+            var key = TrafficPolicy.NormalizeMac(snapshot.MacAddress.ToString());
+            devices.AddOrUpdate(
+                key,
+                _ => new DeviceRecord
+                {
+                    MacAddress = snapshot.MacAddress,
+                    IpAddress = snapshot.IpAddress,
+                    HostName = snapshot.HostName,
+                    FirstSeen = snapshot.FirstSeen,
+                    LastSeen = snapshot.LastSeen,
+                    IsRemembered = true,
+                },
+                (_, existing) =>
+                {
+                    lock (existing.Sync)
+                    {
+                        if (existing.IsRemembered)
+                        {
+                            if (existing.IpAddress.Equals(IPAddress.Any) &&
+                                !snapshot.IpAddress.Equals(IPAddress.Any))
+                            {
+                                existing.IpAddress = snapshot.IpAddress;
+                            }
+
+                            if (snapshot.LastSeen > existing.LastSeen)
+                            {
+                                existing.LastSeen = snapshot.LastSeen;
+                            }
+                        }
+
+                        if (string.IsNullOrWhiteSpace(existing.HostName))
+                        {
+                            existing.HostName = snapshot.HostName;
+                        }
+                    }
+
+                    return existing;
+                });
+        }
+
+        foreach (var key in Usage.Export().Devices.Keys)
+        {
+            if (PhysicalAddress.TryParse(key, out var mac) && IsDeviceMac(mac))
+            {
+                RememberUnknown(mac);
+            }
+        }
+    }
+
+    public void RememberUnknown(PhysicalAddress macAddress, string? hostName = null)
+    {
+        Remember(IPAddress.Any, macAddress, DateTimeOffset.MinValue, hostName);
+    }
+
     /// <summary>
-    /// Moves bytes that have not been through a snapshot yet into <see cref="Usage"/>.
+    /// Flushes cumulative bytes without consuming the independent live-rate window.
     /// </summary>
     public void FlushPendingUsage()
     {
         lock (snapshotSync)
         {
-            DrainPendingBytes();
+            foreach (var (key, record) in devices)
+            {
+                lock (record.Sync)
+                {
+                    DrainPendingBytes(key, record);
+                }
+            }
         }
     }
 
-    private void DrainPendingBytes()
+    private DeviceUsage DrainPendingBytes(string key, DeviceRecord record)
     {
-        foreach (var (key, record) in devices)
-        {
-            var download = Interlocked.Exchange(ref record.DownloadBytes, 0);
-            var upload = Interlocked.Exchange(ref record.UploadBytes, 0);
-            Usage.Add(key, download, upload);
-        }
+        var download = record.PendingDownloadBytes;
+        var upload = record.PendingUploadBytes;
+        record.PendingDownloadBytes = 0;
+        record.PendingUploadBytes = 0;
+        return Usage.Add(key, download, upload);
     }
 
     public void Observe(
@@ -88,18 +166,32 @@ public sealed class DeviceRegistry
                 HostName = hostName,
                 FirstSeen = timestamp,
                 LastSeen = refreshLastSeen ? timestamp : DateTimeOffset.MinValue,
+                IsRemembered = !refreshLastSeen,
             },
             (_, existing) =>
             {
-                existing.IpAddress = ipAddress;
-                if (refreshLastSeen)
+                lock (existing.Sync)
                 {
-                    existing.LastSeen = timestamp;
-                }
+                    if (!ipAddress.Equals(IPAddress.Any) &&
+                        (refreshLastSeen || existing.IsRemembered ||
+                         existing.IpAddress.Equals(IPAddress.Any)))
+                    {
+                        existing.IpAddress = ipAddress;
+                    }
 
-                if (!string.IsNullOrWhiteSpace(hostName))
-                {
-                    existing.HostName = hostName;
+                    if (refreshLastSeen)
+                    {
+                        existing.LastSeen = timestamp;
+                        existing.IsRemembered = false;
+                    }
+
+                    // Observation hints are persisted fallback names, not fresher
+                    // identity evidence than a name learned in this process.
+                    if (string.IsNullOrWhiteSpace(existing.HostName) &&
+                        !string.IsNullOrWhiteSpace(hostName))
+                    {
+                        existing.HostName = hostName;
+                    }
                 }
 
                 return existing;
@@ -116,7 +208,10 @@ public sealed class DeviceRegistry
         var key = TrafficPolicy.NormalizeMac(macAddress.ToString());
         if (devices.TryGetValue(key, out var record))
         {
-            record.HostName = hostName;
+            lock (record.Sync)
+            {
+                record.HostName = hostName;
+            }
         }
     }
 
@@ -126,7 +221,7 @@ public sealed class DeviceRegistry
         int byteCount,
         DateTimeOffset? seenAt = null)
     {
-        if (byteCount <= 0)
+        if (byteCount < 0)
         {
             return;
         }
@@ -137,15 +232,20 @@ public sealed class DeviceRegistry
             return;
         }
 
-        record.LastSeen = seenAt ?? DateTimeOffset.UtcNow;
-
-        if (direction == TrafficDirection.Download)
+        lock (record.Sync)
         {
-            Interlocked.Add(ref record.DownloadBytes, byteCount);
-        }
-        else
-        {
-            Interlocked.Add(ref record.UploadBytes, byteCount);
+            record.LastSeen = seenAt ?? DateTimeOffset.UtcNow;
+            record.IsRemembered = false;
+            if (direction == TrafficDirection.Download)
+            {
+                record.PendingDownloadBytes += byteCount;
+                record.RateDownloadBytes += byteCount;
+            }
+            else
+            {
+                record.PendingUploadBytes += byteCount;
+                record.RateUploadBytes += byteCount;
+            }
         }
     }
 
@@ -158,20 +258,15 @@ public sealed class DeviceRegistry
             var snapshots = new List<DeviceSnapshot>(devices.Count);
             foreach (var (key, record) in devices)
             {
-                var download = Interlocked.Exchange(ref record.DownloadBytes, 0);
-                var upload = Interlocked.Exchange(ref record.UploadBytes, 0);
-                var usage = Usage.Add(key, download, upload);
-                snapshots.Add(
-                    new DeviceSnapshot(
-                        record.MacAddress,
-                        record.IpAddress,
-                        record.HostName,
-                        record.FirstSeen,
-                        record.LastSeen,
-                        download / seconds,
-                        upload / seconds,
-                        usage.DownloadBytes,
-                        usage.UploadBytes));
+                lock (record.Sync)
+                {
+                    var usage = DrainPendingBytes(key, record);
+                    var download = record.RateDownloadBytes;
+                    var upload = record.RateUploadBytes;
+                    record.RateDownloadBytes = 0;
+                    record.RateUploadBytes = 0;
+                    snapshots.Add(CreateSnapshot(record, usage, download / seconds, upload / seconds));
+                }
             }
 
             return snapshots
@@ -184,22 +279,37 @@ public sealed class DeviceRegistry
     public IReadOnlyList<DeviceSnapshot> Peek()
     {
         return devices
-            .Select(
-                pair =>
+            .Select(pair =>
+            {
+                var record = pair.Value;
+                lock (record.Sync)
                 {
-                    var record = pair.Value;
-                    var usage = Usage.Get(pair.Key);
-                    return new DeviceSnapshot(
-                        record.MacAddress,
-                        record.IpAddress,
-                        record.HostName,
-                        record.FirstSeen,
-                        record.LastSeen,
-                        0,
-                        0,
-                        usage.DownloadBytes,
-                        usage.UploadBytes);
-                })
+                    return CreateSnapshot(record, Usage.Get(pair.Key), 0, 0);
+                }
+            })
             .ToArray();
+    }
+
+    private static DeviceSnapshot CreateSnapshot(
+        DeviceRecord record,
+        DeviceUsage usage,
+        double downloadRate,
+        double uploadRate) =>
+        new(
+            record.MacAddress,
+            record.IpAddress,
+            record.HostName,
+            record.FirstSeen,
+            record.LastSeen,
+            downloadRate,
+            uploadRate,
+            usage.DownloadBytes,
+            usage.UploadBytes,
+            record.IsRemembered);
+
+    private static bool IsDeviceMac(PhysicalAddress macAddress)
+    {
+        var bytes = macAddress.GetAddressBytes();
+        return bytes.Length == 6 && bytes.Any(value => value != 0) && (bytes[0] & 1) == 0;
     }
 }

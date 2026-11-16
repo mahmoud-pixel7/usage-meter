@@ -20,18 +20,21 @@ public sealed record DashboardSummary(
             TopDeviceUploadBytesPerSecond,
             DeviceTraffic);
 
+    public int ConfiguredRules => ActiveRules;
+
     public static DashboardSummary From(IEnumerable<DeviceViewModel> devices)
     {
-        var clients = devices.Where(device => device.CanControl).ToArray();
+        var clients = devices.Where(device => !device.IsGateway).ToArray();
         var topDevice = clients
+            .Where(device => device.TotalRate > 0)
             .OrderByDescending(device => device.TotalRate)
             .FirstOrDefault();
 
         return new DashboardSummary(
-            clients.Length,
+            clients.Count(device => device.IsOnline),
             clients.Sum(device => device.DownloadBytesPerSecond),
             clients.Sum(device => device.UploadBytesPerSecond),
-            clients.Count(device => device.HasActiveRule),
+            clients.Count(device => device.HasConfiguredRule),
             topDevice?.DisplayName,
             topDevice?.DownloadBytesPerSecond ?? 0,
             topDevice?.UploadBytesPerSecond ?? 0,

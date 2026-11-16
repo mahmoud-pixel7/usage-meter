@@ -6,7 +6,7 @@ public sealed record DeviceUsage(long DownloadBytes, long UploadBytes)
 {
     public static DeviceUsage Empty { get; } = new(0, 0);
 
-    public long TotalBytes => DownloadBytes + UploadBytes;
+    public long TotalBytes => checked(DownloadBytes + UploadBytes);
 }
 
 public sealed record UsageLedgerSnapshot(
@@ -49,9 +49,7 @@ public sealed class UsageLedger
                 return current;
             }
 
-            var updated = new DeviceUsage(
-                SaturatingAdd(current.DownloadBytes, downloadBytes),
-                SaturatingAdd(current.UploadBytes, uploadBytes));
+            var updated = AddUsage(current, downloadBytes, uploadBytes);
             devices[key] = updated;
             revision++;
             return updated;
@@ -73,6 +71,7 @@ public sealed class UsageLedger
     public void Restore(IReadOnlyDictionary<string, DeviceUsage> saved)
     {
         ArgumentNullException.ThrowIfNull(saved);
+        var normalized = new Dictionary<string, DeviceUsage>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in saved)
         {
             string key;
@@ -82,15 +81,33 @@ public sealed class UsageLedger
             }
             catch (Exception exception) when (exception is FormatException or ArgumentException)
             {
-                continue;
+                throw new ArgumentException("A saved usage MAC address is invalid.", nameof(saved), exception);
             }
 
-            lock (sync)
+            if (pair.Value is not { DownloadBytes: >= 0, UploadBytes: >= 0 } ||
+                pair.Value.DownloadBytes > long.MaxValue - pair.Value.UploadBytes)
             {
-                var current = devices.GetValueOrDefault(key, DeviceUsage.Empty);
-                devices[key] = new DeviceUsage(
-                    SaturatingAdd(current.DownloadBytes, Math.Max(0, pair.Value.DownloadBytes)),
-                    SaturatingAdd(current.UploadBytes, Math.Max(0, pair.Value.UploadBytes)));
+                throw new ArgumentException("Saved usage counters are invalid or overflow.", nameof(saved));
+            }
+
+            if (!normalized.TryAdd(key, pair.Value))
+            {
+                throw new ArgumentException($"Saved usage contains duplicate entries for {key}.", nameof(saved));
+            }
+        }
+
+        lock (sync)
+        {
+            var restored = new Dictionary<string, DeviceUsage>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in normalized)
+            {
+                var current = devices.GetValueOrDefault(pair.Key, DeviceUsage.Empty);
+                restored.Add(pair.Key, AddUsage(current, pair.Value.DownloadBytes, pair.Value.UploadBytes));
+            }
+
+            foreach (var pair in restored)
+            {
+                devices[pair.Key] = pair.Value;
             }
         }
     }
@@ -105,6 +122,12 @@ public sealed class UsageLedger
         }
     }
 
-    private static long SaturatingAdd(long left, long right) =>
-        long.MaxValue - left < right ? long.MaxValue : left + right;
+    private static DeviceUsage AddUsage(DeviceUsage current, long downloadBytes, long uploadBytes)
+    {
+        var updated = new DeviceUsage(
+            checked(current.DownloadBytes + downloadBytes),
+            checked(current.UploadBytes + uploadBytes));
+        _ = updated.TotalBytes;
+        return updated;
+    }
 }

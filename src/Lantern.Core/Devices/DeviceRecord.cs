@@ -12,7 +12,8 @@ public sealed record DeviceSnapshot(
     double DownloadBytesPerSecond,
     double UploadBytesPerSecond,
     long UsageDownloadBytes = 0,
-    long UsageUploadBytes = 0)
+    long UsageUploadBytes = 0,
+    bool IsRemembered = false)
 {
     public double TotalBytesPerSecond => DownloadBytesPerSecond + UploadBytesPerSecond;
 
@@ -21,6 +22,8 @@ public sealed record DeviceSnapshot(
 
 internal sealed class DeviceRecord
 {
+    public object Sync { get; } = new();
+
     public required PhysicalAddress MacAddress { get; init; }
 
     public required IPAddress IpAddress { get; set; }
@@ -31,9 +34,13 @@ internal sealed class DeviceRecord
 
     public required DateTimeOffset LastSeen { get; set; }
 
-    // Bytes since the last snapshot or flush. DeviceRegistry moves them into its
-    // UsageLedger exactly once when it resets them.
-    public long DownloadBytes;
+    public bool IsRemembered { get; set; }
 
-    public long UploadBytes;
+    public long PendingDownloadBytes;
+
+    public long PendingUploadBytes;
+
+    public long RateDownloadBytes;
+
+    public long RateUploadBytes;
 }

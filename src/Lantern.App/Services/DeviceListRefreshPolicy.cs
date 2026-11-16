@@ -6,5 +6,5 @@ public static class DeviceListRefreshPolicy
         bool textInputFocused,
         bool addingNew,
         bool editingItem) =>
-        !textInputFocused && !addingNew && !editingItem;
+        !addingNew && !editingItem;
 }

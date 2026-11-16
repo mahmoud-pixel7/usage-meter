@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Globalization;
+using System.Net;
 using System.Runtime.CompilerServices;
 using Lantern.Core.Devices;
 using Lantern.Core.Settings;
@@ -9,8 +10,8 @@ namespace Lantern.App.ViewModels;
 public sealed class DeviceViewModel : INotifyPropertyChanged
 {
     private readonly Func<DeviceViewModel, Task> changed;
-    private string ipAddress = string.Empty;
-    private string macAddress = string.Empty;
+    private string ipAddress = "-";
+    private string macAddress = "-";
     private string displayName = "Unknown device";
     private string automaticName = "Unknown device";
     private string? alias;
@@ -27,7 +28,10 @@ public sealed class DeviceViewModel : INotifyPropertyChanged
     private bool pauseInternet;
     private bool isProtected;
     private bool isOnline = true;
+    private bool isMonitoring = true;
+    private DateTimeOffset observedAt;
     private string protectedReason = string.Empty;
+    private string captureCoverageText = "Capture-session coverage unavailable.";
 
     public DeviceViewModel(Func<DeviceViewModel, Task> changed)
     {
@@ -62,13 +66,30 @@ public sealed class DeviceViewModel : INotifyPropertyChanged
         }
     }
 
+    public string AutomaticName
+    {
+        get => automaticName;
+        private set => SetField(ref automaticName, value);
+    }
+
     public string? Alias => alias;
 
     public string EditableName
     {
         get => DisplayName;
+        set => EditableAlias = value;
+    }
+
+    public string EditableAlias
+    {
+        get => alias ?? string.Empty;
         set
         {
+            if (!CanRename)
+            {
+                return;
+            }
+
             var normalized = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
             if (string.Equals(alias, normalized, StringComparison.Ordinal))
             {
@@ -77,7 +98,8 @@ public sealed class DeviceViewModel : INotifyPropertyChanged
 
             alias = normalized;
             OnPropertyChanged(nameof(Alias));
-            DisplayName = alias ?? automaticName;
+            OnPropertyChanged(nameof(EditableAlias));
+            DisplayName = alias ?? AutomaticName;
             _ = changed(this);
         }
     }
@@ -168,9 +190,9 @@ public sealed class DeviceViewModel : INotifyPropertyChanged
         get => downloadLimit;
         set
         {
-            if (SetField(ref downloadLimit, Math.Max(0, value)))
+            if (CanControl && SetField(ref downloadLimit, Math.Max(0, value)))
             {
-                OnPropertyChanged(nameof(HasActiveRule));
+                RaiseRuleStateChanged();
                 _ = changed(this);
             }
         }
@@ -181,9 +203,9 @@ public sealed class DeviceViewModel : INotifyPropertyChanged
         get => uploadLimit;
         set
         {
-            if (SetField(ref uploadLimit, Math.Max(0, value)))
+            if (CanControl && SetField(ref uploadLimit, Math.Max(0, value)))
             {
-                OnPropertyChanged(nameof(HasActiveRule));
+                RaiseRuleStateChanged();
                 _ = changed(this);
             }
         }
@@ -191,12 +213,12 @@ public sealed class DeviceViewModel : INotifyPropertyChanged
 
     public bool PauseInternet
     {
-        get => pauseInternet;
+        get => CanControl && pauseInternet;
         set
         {
-            if (SetField(ref pauseInternet, value))
+            if (CanControl && SetField(ref pauseInternet, value))
             {
-                OnPropertyChanged(nameof(HasActiveRule));
+                RaiseRuleStateChanged();
                 _ = changed(this);
             }
         }
@@ -209,27 +231,93 @@ public sealed class DeviceViewModel : INotifyPropertyChanged
         {
             if (SetField(ref isProtected, value))
             {
-                OnPropertyChanged(nameof(CanControl));
-                OnPropertyChanged(nameof(HasActiveRule));
+                RaiseProtectionChanged();
             }
         }
     }
 
     public bool CanControl => !IsProtected;
 
+    public bool IsLocalComputer =>
+        IsProtected && ProtectedReason.StartsWith("This computer", StringComparison.OrdinalIgnoreCase);
+
+    public bool IsGateway => IsProtected && !IsLocalComputer;
+
+    public bool CanRename => !IsGateway;
+
     public bool IsOnline
     {
         get => isOnline;
-        private set => SetField(ref isOnline, value);
+        private set
+        {
+            if (SetField(ref isOnline, value))
+            {
+                OnPropertyChanged(nameof(PresenceText));
+            }
+        }
     }
 
-    public bool HasActiveRule =>
+    public string PresenceText => !IsMonitoring
+        ? "Monitoring stopped"
+        : IsOnline ? "Recently seen" : "Not recently seen";
+
+    public DateTimeOffset ObservedAt
+    {
+        get => observedAt;
+        private set
+        {
+            if (SetField(ref observedAt, value))
+            {
+                OnPropertyChanged(nameof(LastSeenText));
+            }
+        }
+    }
+
+    public string LastSeenText => ObservedAt == default
+        ? "-"
+        : $"Last observed {ObservedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)}";
+
+    public bool IsMonitoring => isMonitoring;
+
+    public string MonitoringStateText => IsMonitoring
+        ? "Monitoring active"
+        : "Monitoring stopped — rates unavailable";
+
+    public string CaptureCoverageText
+    {
+        get => captureCoverageText;
+        private set => SetField(ref captureCoverageText, value);
+    }
+
+    public bool HasConfiguredRule =>
         CanControl && (PauseInternet || DownloadLimit > 0 || UploadLimit > 0);
+
+    public bool HasActiveRule => IsMonitoring && HasConfiguredRule;
+
+    public string PolicyStateText => IsProtected
+        ? "Protected"
+        : !HasConfiguredRule
+            ? "No pause/rate rule"
+            : !IsMonitoring
+                ? PauseInternet ? "IPv4 pause saved" : "IPv4 limits saved"
+                : PauseInternet ? "IPv4 pause enabled" : "IPv4 limits enabled";
+
+    public string PauseStateText => IsProtected
+        ? "Unavailable — protected"
+        : !PauseInternet
+            ? "Not paused by this rule"
+            : IsMonitoring ? "IPv4 pause enabled" : "IPv4 pause saved — control stopped";
 
     public string ProtectedReason
     {
         get => protectedReason;
-        private set => SetField(ref protectedReason, value);
+        private set
+        {
+            if (SetField(ref protectedReason, value))
+            {
+                RaiseProtectionChanged();
+            }
+        }
     }
 
     public void Initialize(
@@ -243,34 +331,36 @@ public sealed class DeviceViewModel : INotifyPropertyChanged
         alias = string.IsNullOrWhiteSpace(preferences?.Alias) ? null : preferences.Alias.Trim();
         downloadLimit = Math.Max(0, preferences?.DownloadKiloBytesPerSecond ?? 0);
         uploadLimit = Math.Max(0, preferences?.UploadKiloBytesPerSecond ?? 0);
-        pauseInternet = !isProtectedDevice && (preferences?.PauseInternet ?? false);
+        pauseInternet = preferences?.PauseInternet ?? false;
+        SetProtection(isProtectedDevice, protectedDeviceReason);
+        OnPropertyChanged(nameof(Alias));
+        OnPropertyChanged(nameof(EditableName));
+        OnPropertyChanged(nameof(EditableAlias));
         OnPropertyChanged(nameof(DownloadLimit));
         OnPropertyChanged(nameof(UploadLimit));
         OnPropertyChanged(nameof(PauseInternet));
-        OnPropertyChanged(nameof(HasActiveRule));
-        IsProtected = isProtectedDevice;
-        ProtectedReason = protectedDeviceReason;
+        RaiseRuleStateChanged();
         Update(snapshot, preferences?.Alias);
+    }
+
+    public void SetProtection(bool isProtectedDevice, string protectedDeviceReason)
+    {
+        ProtectedReason = isProtectedDevice ? protectedDeviceReason : string.Empty;
+        IsProtected = isProtectedDevice;
     }
 
     public void Update(DeviceSnapshot snapshot, string? alias)
     {
-        IpAddress = snapshot.IpAddress.ToString();
-        if (this.alias is null && !string.IsNullOrWhiteSpace(alias))
-        {
-            this.alias = alias.Trim();
-            OnPropertyChanged(nameof(Alias));
-        }
-
-        automaticName = !string.IsNullOrWhiteSpace(snapshot.HostName)
-            ? snapshot.HostName
-            : $"Device {IpAddress}";
-        DisplayName = this.alias ?? automaticName;
-        DownloadBytesPerSecond = snapshot.DownloadBytesPerSecond;
-        UploadBytesPerSecond = snapshot.UploadBytesPerSecond;
-        DownloadRate = FormatRate(snapshot.DownloadBytesPerSecond);
-        UploadRate = FormatRate(snapshot.UploadBytesPerSecond);
-        TotalRate = snapshot.TotalBytesPerSecond;
+        IpAddress = snapshot.IpAddress.Equals(IPAddress.Any) || snapshot.IpAddress.Equals(IPAddress.IPv6Any)
+            ? "-"
+            : snapshot.IpAddress.ToString();
+        ObservedAt = snapshot.LastSeen;
+        AutomaticName = string.IsNullOrWhiteSpace(snapshot.HostName)
+            ? "Unknown device"
+            : snapshot.HostName.Trim();
+        // Saved aliases are loaded once; snapshot refreshes must not restore a just-cleared alias.
+        DisplayName = this.alias ?? AutomaticName;
+        ApplyRates(snapshot.DownloadBytesPerSecond, snapshot.UploadBytesPerSecond);
         UsageDownloadBytes = snapshot.UsageDownloadBytes;
         UsageUploadBytes = snapshot.UsageUploadBytes;
         UsageTotalBytes = snapshot.UsageTotalBytes;
@@ -279,19 +369,34 @@ public sealed class DeviceViewModel : INotifyPropertyChanged
     public void SetPresence(bool online)
     {
         IsOnline = online;
-        if (!IsProtected)
+    }
+
+    public void SetMonitoring(bool monitoring)
+    {
+        if (!SetField(ref isMonitoring, monitoring, nameof(IsMonitoring)))
         {
-            ProtectedReason = online ? "Online" : "Offline";
+            return;
         }
+
+        ApplyRates(0, 0);
+        OnPropertyChanged(nameof(PresenceText));
+        OnPropertyChanged(nameof(MonitoringStateText));
+        RaiseRuleStateChanged();
+    }
+
+    public void SetCaptureCoverage(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        CaptureCoverageText = text;
     }
 
     public static string FormatRate(double bytesPerSecond)
     {
         return bytesPerSecond switch
         {
-            >= 1_000_000 => $"{bytesPerSecond / 1_000_000:0.0} MB/s",
-            >= 1_000 => $"{bytesPerSecond / 1_000:0.0} KB/s",
-            _ => $"{bytesPerSecond:0} B/s",
+            >= 1_000_000 => string.Create(CultureInfo.InvariantCulture, $"{bytesPerSecond / 1_000_000:0.0} MB/s"),
+            >= 1_000 => string.Create(CultureInfo.InvariantCulture, $"{bytesPerSecond / 1_000:0.0} KB/s"),
+            _ => string.Create(CultureInfo.InvariantCulture, $"{bytesPerSecond:0} B/s"),
         };
     }
 
@@ -311,8 +416,36 @@ public sealed class DeviceViewModel : INotifyPropertyChanged
     public static string FormatExactBytes(long bytes) =>
         string.Create(CultureInfo.InvariantCulture, $"{Math.Max(0, bytes):N0} bytes");
 
-    private static string FormatMac(string value) =>
-        string.Join(":", Enumerable.Range(0, 6).Select(index => value.Substring(index * 2, 2)));
+    private void ApplyRates(double download, double upload)
+    {
+        DownloadBytesPerSecond = IsMonitoring && double.IsFinite(download) ? Math.Max(0, download) : 0;
+        UploadBytesPerSecond = IsMonitoring && double.IsFinite(upload) ? Math.Max(0, upload) : 0;
+        TotalRate = DownloadBytesPerSecond + UploadBytesPerSecond;
+        DownloadRate = IsMonitoring ? FormatRate(DownloadBytesPerSecond) : "—";
+        UploadRate = IsMonitoring ? FormatRate(UploadBytesPerSecond) : "—";
+    }
+
+    private void RaiseProtectionChanged()
+    {
+        OnPropertyChanged(nameof(PauseInternet));
+        OnPropertyChanged(nameof(CanControl));
+        OnPropertyChanged(nameof(CanRename));
+        OnPropertyChanged(nameof(IsLocalComputer));
+        OnPropertyChanged(nameof(IsGateway));
+        RaiseRuleStateChanged();
+    }
+
+    private void RaiseRuleStateChanged()
+    {
+        OnPropertyChanged(nameof(HasConfiguredRule));
+        OnPropertyChanged(nameof(HasActiveRule));
+        OnPropertyChanged(nameof(PolicyStateText));
+        OnPropertyChanged(nameof(PauseStateText));
+    }
+
+    private static string FormatMac(string value) => value.Length == 12
+        ? string.Join(":", Enumerable.Range(0, 6).Select(index => value.Substring(index * 2, 2)))
+        : "-";
 
     private bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
     {

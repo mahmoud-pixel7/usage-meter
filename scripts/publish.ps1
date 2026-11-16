@@ -13,7 +13,7 @@ $testProjects = @(
     (Join-Path $projectRoot "tests\Lantern.Core.Tests\Lantern.Core.Tests.csproj"),
     (Join-Path $projectRoot "tests\Lantern.App.Tests\Lantern.App.Tests.csproj")
 )
-$releaseVersion = "1.0.0"
+$releaseVersion = "1.0.1"
 
 foreach ($testProject in $testProjects) {
     dotnet test $testProject -c $Configuration

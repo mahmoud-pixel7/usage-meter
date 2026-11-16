@@ -220,6 +220,82 @@ public sealed class FrameRouterTests
         Assert.Equal(FrameAction.Forward, router.Route(latestAddressFrame).Action);
     }
 
+    [Fact]
+    public void Route_Ipv6IsIgnoredEvenWhenTheClientIsPaused()
+    {
+        var policy = new TrafficPolicy();
+        policy.SetRule(ClientMac.ToString(), new TrafficRule(true, 0, 0));
+        var router = CreateRouter(policy);
+        var frame = new byte[14 + 40 + 100];
+        LocalMac.GetAddressBytes().CopyTo(frame, 0);
+        ClientMac.GetAddressBytes().CopyTo(frame, 6);
+        frame[12] = 0x86;
+        frame[13] = 0xdd;
+        frame[14] = 0x60;
+
+        var result = router.Route(frame);
+
+        Assert.Equal(FrameAction.Ignore, result.Action);
+        Assert.Equal(FrameIgnoreReason.Ipv6ObservationOnly, result.IgnoreReason);
+        Assert.Null(result.Direction);
+        Assert.Null(result.Frame);
+        Assert.Equal(0, result.MeteredByteCount);
+    }
+
+    [Fact]
+    public void Route_IgnoredFramesExplainWhetherTheBindingOrCapturePathDidNotMatch()
+    {
+        var router = CreateRouter();
+        var unknownClient = BuildIpv4Frame(LocalMac, ClientMac,
+            IPAddress.Parse("192.168.31.200"), IPAddress.Parse("1.1.1.1"), 40);
+        var wrongMac = BuildIpv4Frame(LocalMac, PhysicalAddress.Parse("001122334455"),
+            ClientIp, IPAddress.Parse("1.1.1.1"), 40);
+        var injectedCopy = BuildIpv4Frame(GatewayMac, LocalMac,
+            ClientIp, IPAddress.Parse("1.1.1.1"), 40);
+        var originalLocal = BuildIpv4Frame(GatewayMac, LocalMac,
+            LocalIp, IPAddress.Parse("1.1.1.1"), 40);
+
+        Assert.Equal(FrameIgnoreReason.UnknownClient, router.Route(unknownClient).IgnoreReason);
+        Assert.Equal(FrameIgnoreReason.ClientBindingMismatch, router.Route(wrongMac).IgnoreReason);
+        Assert.Equal(FrameIgnoreReason.NotAddressedToController, router.Route(injectedCopy).IgnoreReason);
+        Assert.Equal(FrameIgnoreReason.LocalComputerTraffic, router.Route(originalLocal).IgnoreReason);
+        Assert.Equal(FrameIgnoreReason.InvalidOrUnsupportedFrame, router.Route([]).IgnoreReason);
+    }
+
+    [Theory]
+    [InlineData("192.168.31.247")]
+    [InlineData("192.168.31.1")]
+    [InlineData("192.168.31.0")]
+    [InlineData("192.168.31.255")]
+    [InlineData("192.168.32.61")]
+    public void UpdateClient_WithAdapterScopeCannotInstallProtectedOrOutOfSubnetBindings(string address)
+    {
+        var adapter = new AdapterProfile("synthetic", "No capture", "Test", LocalIp, 24,
+            IPAddress.Parse("192.168.31.1"), LocalMac);
+        var router = new FrameRouter(LocalMac, LocalIp, GatewayMac,
+            new Dictionary<IPAddress, PhysicalAddress>(), new TrafficPolicy(), adapter: adapter);
+        var unsafeAddress = IPAddress.Parse(address);
+        router.UpdateClient(unsafeAddress, ClientMac);
+        var frame = BuildIpv4Frame(LocalMac, ClientMac, unsafeAddress, IPAddress.Parse("1.1.1.1"), 40);
+
+        Assert.Equal(FrameAction.Ignore, router.Route(frame).Action);
+    }
+
+    [Theory]
+    [InlineData("345A6063C052")]
+    [InlineData("64644A380A15")]
+    [InlineData("FFFFFFFFFFFF")]
+    public void UpdateClient_CannotInstallControllerGatewayOrBroadcastMac(string macAddress)
+    {
+        var router = new FrameRouter(LocalMac, LocalIp, GatewayMac,
+            new Dictionary<IPAddress, PhysicalAddress>(), new TrafficPolicy());
+        var mac = PhysicalAddress.Parse(macAddress);
+        router.UpdateClient(ClientIp, mac);
+        var frame = BuildIpv4Frame(LocalMac, mac, ClientIp, IPAddress.Parse("1.1.1.1"), 40);
+
+        Assert.Equal(FrameAction.Ignore, router.Route(frame).Action);
+    }
+
     private static FrameRouter CreateRouter(
         TrafficPolicy? policy = null,
         bool enforceRateLimits = true) =>

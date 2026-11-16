@@ -7,7 +7,7 @@ public sealed class DeviceListRefreshPolicyTests
 {
     [Theory]
     [InlineData(false, false, false, true)]
-    [InlineData(true, false, false, false)]
+    [InlineData(true, false, false, true)]
     [InlineData(false, true, false, false)]
     [InlineData(false, false, true, false)]
     public void ShouldRefresh_OnlyWhenNoEditTransactionIsActive(

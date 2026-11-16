@@ -1,28 +1,22 @@
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.NetworkInformation;
 
 namespace Lantern.App.Services;
 
 public sealed class ResolvedDeviceNameClaims
 {
-    private readonly string controllerHostName;
-    private readonly ConcurrentDictionary<string, string> owners =
+    private readonly ConcurrentDictionary<string, string> namesByMac =
         new(StringComparer.OrdinalIgnoreCase);
-    private HashSet<string> rejectedNames = new(StringComparer.OrdinalIgnoreCase);
 
     public ResolvedDeviceNameClaims(string controllerHostName)
     {
-        this.controllerHostName = Normalize(controllerHostName) ?? string.Empty;
+        // A shared hostname, including the controller's, is not identity evidence.
     }
 
     public void Reset(IEnumerable<string>? rejected = null)
     {
-        owners.Clear();
-        rejectedNames = (rejected ?? [])
-            .Select(Normalize)
-            .Where(name => name is not null)
-            .Cast<string>()
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        namesByMac.Clear();
     }
 
     public bool TryClaim(
@@ -42,31 +36,46 @@ public sealed class ResolvedDeviceNameClaims
         ArgumentNullException.ThrowIfNull(macAddress);
         isNewClaim = false;
         acceptedName = Normalize(candidate) ?? string.Empty;
-        if (acceptedName.Length == 0 ||
-            rejectedNames.Contains(acceptedName) ||
-            string.Equals(acceptedName, controllerHostName, StringComparison.OrdinalIgnoreCase))
+        if (acceptedName.Length == 0)
         {
-            acceptedName = string.Empty;
             return false;
         }
 
         var macKey = macAddress.ToString();
-        if (owners.TryAdd(acceptedName, macKey))
+        while (true)
         {
-            isNewClaim = true;
-            return true;
-        }
+            if (!namesByMac.TryGetValue(macKey, out var previousName))
+            {
+                if (namesByMac.TryAdd(macKey, acceptedName))
+                {
+                    isNewClaim = true;
+                    return true;
+                }
 
-        var owner = owners.GetValueOrDefault(acceptedName);
-        if (string.Equals(owner, macKey, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
+                continue;
+            }
 
-        acceptedName = string.Empty;
-        return false;
+            if (string.Equals(previousName, acceptedName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (namesByMac.TryUpdate(macKey, acceptedName, previousName))
+            {
+                isNewClaim = true;
+                return true;
+            }
+        }
     }
 
-    private static string? Normalize(string? value) =>
-        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+    private static string? Normalize(string? value)
+    {
+        var name = value?.Trim();
+        return string.IsNullOrEmpty(name) ||
+               name.Length > 253 ||
+               name.Any(char.IsControl) ||
+               IPAddress.TryParse(name, out _)
+            ? null
+            : name;
+    }
 }

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Runtime.CompilerServices;
 using Lantern.Core.Control;
 using Lantern.Core.Devices;
 using Lantern.Core.Networking;
@@ -15,7 +16,10 @@ public sealed class PcapLanEngine : IAsyncDisposable
 
     public static TimeSpan ProbeReplyWindow { get; } = TimeSpan.FromMilliseconds(800);
 
+    public const string ForwardingFilter = "ip or ip6";
+
     private readonly object arpSendSync = new();
+    private readonly object identitySync = new();
     private readonly SemaphoreSlim refreshSync = new(1, 1);
     private readonly SemaphoreSlim stopSync = new(1, 1);
     private readonly TrafficPolicy policy;
@@ -24,9 +28,16 @@ public sealed class PcapLanEngine : IAsyncDisposable
         PassiveDiscoveryProfile.Default;
     private readonly ClientMappingCache clientMappings = new();
     private readonly ResolvedDeviceNameClaims resolvedNameClaims = new(Dns.GetHostName());
-    private readonly ConcurrentDictionary<string, byte> resolvingNames =
+    private readonly NameResolutionRetryGate nameRetryGate = new();
+    private readonly ConditionalWeakTable<DeviceIdentityLearnedEventArgs, IdentityBinding> issuedIdentities = new();
+    private readonly Dictionary<string, DeviceIdentityLearnedEventArgs> latestIdentities =
         new(StringComparer.OrdinalIgnoreCase);
+    private CaptureDiagnostics diagnostics = new();
+    private LocalIpv4TrafficMeter? localMeter;
+    private long sessionSequence;
+    private long activeSessionId;
     private CancellationTokenSource? engineCancellation;
+    private CancellationTokenRegistration cancellationRegistration;
     private Task? backgroundTask;
     private LibPcapLiveDevice? arpDevice;
     private LibPcapLiveDevice? forwardingDevice;
@@ -54,11 +65,49 @@ public sealed class PcapLanEngine : IAsyncDisposable
 
     public bool IsControlling => controlling;
 
+    public bool IsGatewayMac(PhysicalAddress macAddress) =>
+        gatewayMac is { } current && current.Equals(macAddress);
+
     public long ForwardedPacketCount => Interlocked.Read(ref forwardedPacketCount);
 
     public long DroppedPacketCount => Interlocked.Read(ref droppedPacketCount);
 
     public string DriverName { get; private set; } = "Not started";
+
+    public string StopStatus { get; private set; } = "Not started; no network restoration was attempted.";
+
+    public string LastStopStatus => StopStatus;
+
+    public long SessionId => Interlocked.Read(ref activeSessionId);
+
+    public CaptureDiagnosticsSnapshot GetDiagnosticsSnapshot() => diagnostics.Snapshot() with
+    {
+        RestorationTargets = clientMappings.RestorationTargetCount,
+    };
+
+    public string GetDiagnosticsSummary() => CaptureDiagnosticsFormatter.Format(GetDiagnosticsSnapshot());
+
+    public DeviceCaptureCoverage GetCoverage(PhysicalAddress macAddress) => diagnostics.GetCoverage(macAddress);
+
+    public string GetCoverageStatus(string macAddress) =>
+        PhysicalAddress.TryParse(macAddress, out var mac)
+            ? diagnostics.GetCoverage(mac).Status
+            : "No valid MAC address is available for capture coverage.";
+
+    public bool IsIdentityCurrent(DeviceIdentityLearnedEventArgs identity)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        lock (identitySync)
+        {
+            return controlling && !restoring && identity.SessionId != 0 &&
+                   identity.SessionId == SessionId && identity.Address is { } address &&
+                   latestIdentities.TryGetValue(identity.MacAddress.ToString(), out var latest) &&
+                   ReferenceEquals(latest, identity) &&
+                   issuedIdentities.TryGetValue(identity, out var binding) &&
+                   clientMappings.IsCurrentBinding(
+                       address, identity.MacAddress, binding.Version, requireObserved: true);
+        }
+    }
 
     public event EventHandler<string>? StatusChanged;
 
@@ -92,93 +141,177 @@ public sealed class PcapLanEngine : IAsyncDisposable
         }
 
         await NpfDriverService.EnsureAvailableAsync(cancellationToken);
-        profile = adapter;
-        clientMappings.BeginAdapter(adapter.Id);
-        resolvedNameClaims.Reset(rejectedResolvedNames);
-        resolvingNames.Clear();
-        registry.BeginSession();
+        var startedSession = 0L;
         var clients = clientMappings.Mappings;
-        restoring = false;
-        backgroundFailure = null;
-        Interlocked.Exchange(ref forwardedPacketCount, 0);
-        Interlocked.Exchange(ref droppedPacketCount, 0);
-        gatewayResolution = new TaskCompletionSource<PhysicalAddress>(
+        var pendingGateway = new TaskCompletionSource<PhysicalAddress>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-
-        var captureDevice = LibPcapLiveDeviceList.Instance
-            .FirstOrDefault(candidate => candidate.MacAddress?.Equals(adapter.LocalMac) == true)
-            ?? throw new InvalidOperationException(
-                $"WinPcap could not match the Windows adapter “{adapter.Name}”.");
 
         try
         {
-            arpDevice = captureDevice;
-            arpDevice.OnPacketArrival += OnArpPacketArrival;
-            arpDevice.Open(PcapCaptureConfiguration.CreateForArpDiscovery());
-            arpDevice.Filter = "arp";
-            arpDevice.StartCapture();
+            await stopSync.WaitAsync(cancellationToken);
+            try
+            {
+                if (IsRunning || profile is not null)
+                {
+                    return;
+                }
 
-            forwardingDevice = new LibPcapLiveDevice(
-                captureDevice.Interface ??
-                throw new InvalidOperationException("The capture adapter has no interface."));
-            forwardingDevice.Open(PcapCaptureConfiguration.CreateForForwarding());
-            forwardingDevice.Filter = "ip";
-            DriverName = captureDevice.Description ?? captureDevice.Name;
-            RaiseStatus($"Resolving gateway {adapter.GatewayAddress}…");
+                lock (identitySync)
+                {
+                    profile = adapter;
+                    gatewayMac = null;
+                    clientMappings.BeginAdapter(adapter);
+                    resolvedNameClaims.Reset(rejectedResolvedNames);
+                    activeSessionId = ++sessionSequence;
+                    startedSession = activeSessionId;
+                    latestIdentities.Clear();
+                    nameRetryGate.BeginSession(activeSessionId);
+                    restoring = false;
+                    controlling = false;
+                    gatewayResolution = pendingGateway;
+                }
 
-            SendArpPacket(
-                EthernetFrameCodec.BuildArpRequest(
-                    adapter.LocalMac,
-                    adapter.LocalAddress,
-                    adapter.GatewayAddress));
+                registry.BeginSession();
+                diagnostics = new CaptureDiagnostics();
+                StopStatus = "Running; peer restoration has not been attempted.";
+                backgroundFailure = null;
+                Interlocked.Exchange(ref forwardedPacketCount, 0);
+                Interlocked.Exchange(ref droppedPacketCount, 0);
+                var captureDevice = LibPcapLiveDeviceList.Instance
+                    .FirstOrDefault(candidate => candidate.MacAddress?.Equals(adapter.LocalMac) == true)
+                    ?? throw new InvalidOperationException(
+                        $"WinPcap could not match the Windows adapter “{adapter.Name}”.");
+                arpDevice = captureDevice;
+                arpDevice.OnPacketArrival += OnArpPacketArrival;
+                arpDevice.Open(PcapCaptureConfiguration.CreateForArpDiscovery());
+                arpDevice.Filter = "arp";
+                arpDevice.StartCapture();
 
-            gatewayMac = await gatewayResolution.Task.WaitAsync(
+                forwardingDevice = new LibPcapLiveDevice(
+                    captureDevice.Interface ??
+                    throw new InvalidOperationException("The capture adapter has no interface."));
+                forwardingDevice.Open(PcapCaptureConfiguration.CreateForForwarding());
+                forwardingDevice.Filter = ForwardingFilter;
+                DriverName = captureDevice.Description ?? captureDevice.Name;
+                RaiseStatus($"Resolving gateway {adapter.GatewayAddress}…");
+
+                SendArpPacket(
+                    EthernetFrameCodec.BuildArpRequest(
+                        adapter.LocalMac,
+                        adapter.LocalAddress,
+                        adapter.GatewayAddress));
+            }
+            finally
+            {
+                stopSync.Release();
+            }
+
+            var resolvedGatewayMac = await pendingGateway.Task.WaitAsync(
                 TimeSpan.FromSeconds(4),
                 cancellationToken);
-            registry.Observe(
-                adapter.GatewayAddress,
-                gatewayMac,
-                DateTimeOffset.UtcNow,
-                "Gateway");
-
-            frameRouter = new FrameRouter(
-                adapter.LocalMac,
-                adapter.LocalAddress,
-                gatewayMac,
-                clients,
-                policy);
-
-            RaiseStatus("Loading devices already observed by Windows…");
-            engineCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            controlling = true;
+            CancellationToken engineToken;
+            Task forwardingTask;
             var forwarderStarted = new TaskCompletionSource(
                 TaskCreationOptions.RunContinuationsAsynchronously);
-            var forwardingTask = Task.Run(
-                () => RunForwardingLoop(engineCancellation.Token, forwarderStarted));
-            backgroundTask = forwardingTask;
+            lock (identitySync)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (restoring || SessionId != startedSession || !ReferenceEquals(profile, adapter))
+                {
+                    throw new OperationCanceledException("Monitoring startup was stopped.");
+                }
+
+                gatewayMac = resolvedGatewayMac;
+                clientMappings.SetGatewayMac(resolvedGatewayMac);
+                registry.Observe(
+                    adapter.GatewayAddress,
+                    resolvedGatewayMac,
+                    DateTimeOffset.UtcNow,
+                    "Gateway");
+                registry.Observe(
+                    adapter.LocalAddress,
+                    adapter.LocalMac,
+                    DateTimeOffset.UtcNow,
+                    Dns.GetHostName());
+                localMeter = new LocalIpv4TrafficMeter(adapter, resolvedGatewayMac);
+
+                frameRouter = new FrameRouter(
+                    adapter.LocalMac,
+                    adapter.LocalAddress,
+                    resolvedGatewayMac,
+                    clients,
+                    policy,
+                    adapter: adapter);
+
+                RaiseStatus("Loading devices already observed by Windows…");
+                engineCancellation = new CancellationTokenSource();
+                engineToken = engineCancellation.Token;
+                controlling = true;
+                forwardingTask = Task.Run(
+                    () => RunForwardingLoop(engineToken, forwarderStarted));
+                backgroundTask = forwardingTask;
+                // Cancellation requests the restore-first shutdown rather than
+                // cancelling forwarding while peers still point at this computer.
+                cancellationRegistration = cancellationToken.Register(() =>
+                {
+                    _ = Task.Run(() => StopSessionAsync(startedSession));
+                });
+            }
             await forwarderStarted.Task.WaitAsync(
                 TimeSpan.FromSeconds(2),
                 cancellationToken);
 
-            await RefreshNeighborsAsync(engineCancellation.Token);
+            await RefreshNeighborsAsync(engineToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            engineToken.ThrowIfCancellationRequested();
+            if (restoring || SessionId != startedSession)
+            {
+                throw new OperationCanceledException("Monitoring startup was stopped.");
+            }
 
-            PoisonClients();
-            backgroundTask = Task.WhenAll(
-                forwardingTask,
-                RunMaintenanceAsync(engineCancellation.Token));
-            const string activeMessage =
-                "Live monitoring active — 0 KB/s is unlimited and remains visible.";
-            RaiseStatus(activeMessage);
-            RaiseStateChanged(true, activeMessage);
+            await Task.Run(PoisonClients, engineToken);
+            lock (identitySync)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                engineToken.ThrowIfCancellationRequested();
+                if (restoring || SessionId != startedSession)
+                {
+                    throw new OperationCanceledException("Monitoring startup was stopped.");
+                }
+
+                backgroundTask = Task.WhenAll(
+                    forwardingTask,
+                    Task.Run(() => RunMaintenanceAsync(engineToken)));
+                const string activeMessage =
+                    "IPv4 payload monitoring active — observed traffic only, not complete router usage; IPv6 is diagnostics-only.";
+                RaiseStatus(activeMessage);
+                RaiseStateChanged(true, activeMessage);
+            }
         }
         catch (Exception exception)
         {
-            var forwardingFailure = backgroundFailure;
-            Interlocked.CompareExchange(
-                ref backgroundFailure,
-                $"Startup failed: {exception.Message}",
-                null);
-            await StopAsync();
+            string? forwardingFailure = null;
+            lock (identitySync)
+            {
+                if (startedSession != 0 && SessionId == startedSession)
+                {
+                    forwardingFailure = backgroundFailure;
+                    if (exception is not OperationCanceledException ||
+                        (!cancellationToken.IsCancellationRequested && !restoring))
+                    {
+                        Interlocked.CompareExchange(
+                            ref backgroundFailure,
+                            $"Startup failed: {exception.Message}",
+                            null);
+                    }
+                }
+            }
+
+            if (startedSession != 0)
+            {
+                await StopSessionAsync(startedSession);
+            }
+
             if (forwardingFailure is not null)
             {
                 throw new InvalidOperationException(forwardingFailure, exception);
@@ -191,10 +324,12 @@ public sealed class PcapLanEngine : IAsyncDisposable
     public async Task<DiscoveryRefreshResult> RefreshNeighborsAsync(
         CancellationToken cancellationToken = default)
     {
-        await refreshSync.WaitAsync(cancellationToken);
+        await refreshSync.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await RefreshNeighborsCoreAsync(cancellationToken);
+            return await Task.Run(
+                () => RefreshNeighborsCoreAsync(cancellationToken),
+                cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -205,13 +340,8 @@ public sealed class PcapLanEngine : IAsyncDisposable
     private async Task<DiscoveryRefreshResult> RefreshNeighborsCoreAsync(
         CancellationToken cancellationToken)
     {
-        foreach (var device in registry.Peek()
-                     .Where(device => string.IsNullOrWhiteSpace(device.HostName)))
-        {
-            resolvingNames.TryRemove(device.MacAddress.ToString(), out _);
-        }
-
         var clients = clientMappings.Mappings;
+        var expectedSession = SessionId;
         var activeProfile = profile ??
             throw new InvalidOperationException("Select and start an adapter before refreshing.");
         var probeReplies = new ConcurrentDictionary<IPAddress, PhysicalAddress>();
@@ -230,13 +360,9 @@ public sealed class PcapLanEngine : IAsyncDisposable
             activeKnownDeviceReplies = null;
         }
 
-        foreach (var discovered in probeReplies)
+        if (expectedSession == 0 || expectedSession != SessionId || restoring)
         {
-            registry.Observe(
-                discovered.Key,
-                discovered.Value,
-                DateTimeOffset.UtcNow,
-                GetKnownHostName(discovered.Value));
+            return new DiscoveryRefreshResult(probesSent, probeReplies.Count, clients.Count);
         }
 
         await RefreshWindowsNeighborCacheAsync(
@@ -255,19 +381,38 @@ public sealed class PcapLanEngine : IAsyncDisposable
         ConcurrentDictionary<IPAddress, PhysicalAddress> clients,
         CancellationToken cancellationToken)
     {
+        var expectedSession = SessionId;
         var neighbors = await WindowsNeighborCache.ReadAsync(
             activeProfile,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
+        if (expectedSession == 0 || expectedSession != SessionId || restoring ||
+            !ReferenceEquals(profile, activeProfile))
+        {
+            return;
+        }
+
         var requestedRealMappings = false;
         foreach (var neighbor in neighbors)
         {
+            if (restoring || expectedSession != SessionId)
+            {
+                return;
+            }
+
             if (neighbor.Address.Equals(activeProfile.GatewayAddress))
             {
-                registry.Observe(
+                registry.Remember(
                     neighbor.Address,
-                    neighbor.MacAddress,
+                    gatewayMac ?? neighbor.MacAddress,
                     DateTimeOffset.UtcNow,
                     "Gateway");
+                continue;
+            }
+
+            if (!TrafficMetering.IsClientAddress(activeProfile, neighbor.Address))
+            {
+                diagnostics.RecordMappingUpdate(new ClientMappingUpdate(
+                    false, false, false, 0, ClientMappingRejection.ProtectedOrOutOfSubnet));
                 continue;
             }
 
@@ -277,6 +422,11 @@ public sealed class PcapLanEngine : IAsyncDisposable
                     activeProfile,
                     neighbor.Address,
                     cancellationToken);
+                if (restoring || expectedSession != SessionId)
+                {
+                    return;
+                }
+
                 SendArpPacket(
                     EthernetFrameCodec.BuildArpRequest(
                         activeProfile.LocalMac,
@@ -286,15 +436,33 @@ public sealed class PcapLanEngine : IAsyncDisposable
                 continue;
             }
 
-            var needsPoison = clientMappings.Upsert(neighbor.Address, neighbor.MacAddress);
-            frameRouter?.UpdateClient(neighbor.Address, neighbor.MacAddress);
-            registry.Remember(
-                neighbor.Address,
-                neighbor.MacAddress,
-                DateTimeOffset.UtcNow,
-                GetKnownHostName(neighbor.MacAddress));
+            var update = clientMappings.UpsertChecked(neighbor.Address, neighbor.MacAddress, observed: false);
+            diagnostics.RecordMappingUpdate(update);
+            if (!update.Accepted)
+            {
+                if (!clients.ContainsKey(neighbor.Address))
+                {
+                    frameRouter?.RemoveClient(neighbor.Address);
+                }
+
+                continue;
+            }
+
+            if (!clientMappings.WithCurrentBinding(neighbor.Address, neighbor.MacAddress, update.BindingVersion, () =>
+                {
+                    frameRouter?.UpdateClient(neighbor.Address, neighbor.MacAddress);
+                    registry.Remember(
+                        neighbor.Address,
+                        neighbor.MacAddress,
+                        DateTimeOffset.UtcNow,
+                        GetKnownHostName(neighbor.MacAddress));
+                }))
+            {
+                continue;
+            }
+
             _ = ResolveNameAsync(neighbor.Address, neighbor.MacAddress);
-            if (controlling && needsPoison)
+            if (controlling && update.Changed)
             {
                 PoisonClient(
                     new KeyValuePair<IPAddress, PhysicalAddress>(
@@ -314,14 +482,25 @@ public sealed class PcapLanEngine : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var probesSent = 0;
+        var expectedSession = SessionId;
         var hints = knownDeviceHints
-            .Where(hint => !hint.MacAddress.Equals(activeProfile.LocalMac))
+            .Where(hint => TrafficMetering.IsUnicastMac(hint.MacAddress) &&
+                           !hint.MacAddress.Equals(activeProfile.LocalMac) &&
+                           !hint.MacAddress.Equals(gatewayMac))
             .ToArray();
+        var addressedHints = hints.Where(hint => hint.LastKnownIp is { } address &&
+            TrafficMetering.CanInterceptClient(activeProfile, address, hint.MacAddress, gatewayMac)).ToArray();
 
         // Try remembered addresses first. This usually rediscovers a client in
         // milliseconds without scanning the rest of the subnet.
-        foreach (var hint in hints.Where(hint => hint.LastKnownIp is not null))
+        foreach (var hint in addressedHints)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (restoring || expectedSession == 0 || expectedSession != SessionId)
+            {
+                return probesSent;
+            }
+
             SendArpPacket(
                 EthernetFrameCodec.BuildUnicastArpRequest(
                     activeProfile.LocalMac,
@@ -331,7 +510,7 @@ public sealed class PcapLanEngine : IAsyncDisposable
             probesSent++;
         }
 
-        if (hints.Any(hint => hint.LastKnownIp is not null))
+        if (addressedHints.Length > 0)
         {
             await Task.Delay(TimeSpan.FromMilliseconds(150), cancellationToken);
         }
@@ -341,7 +520,12 @@ public sealed class PcapLanEngine : IAsyncDisposable
                      activeProfile.PrefixLength))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (!address.Equals(activeProfile.GatewayAddress))
+            if (restoring || expectedSession == 0 || expectedSession != SessionId)
+            {
+                return probesSent;
+            }
+
+            if (TrafficMetering.IsClientAddress(activeProfile, address))
             {
                 // Keep ordinary broadcast discovery for wired clients.
                 SendArpPacket(
@@ -357,6 +541,12 @@ public sealed class PcapLanEngine : IAsyncDisposable
                 // the router or client ARP tables.
                 foreach (var hint in hints)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (restoring || expectedSession != SessionId)
+                    {
+                        return probesSent;
+                    }
+
                     var key = TrafficPolicy.NormalizeMac(hint.MacAddress.ToString());
                     if (activeKnownDeviceReplies?.ContainsKey(key) == true ||
                         Equals(hint.LastKnownIp, address))
@@ -383,73 +573,125 @@ public sealed class PcapLanEngine : IAsyncDisposable
         return probesSent;
     }
 
-    public async Task StopAsync()
+    public Task StopAsync() => StopSessionAsync();
+
+    private async Task StopSessionAsync(long? expectedSession = null)
     {
-        await stopSync.WaitAsync();
+        await stopSync.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (!IsRunning && profile is null)
+            if (expectedSession is null || SessionId == expectedSession)
             {
-                return;
+                await Task.Run(StopCoreAsync).ConfigureAwait(false);
             }
-
-            restoring = true;
-            try
-            {
-                await ForwardingShutdown.RunAsync(
-                    () => arpDevice is null ? Task.CompletedTask : RestoreArpAsync(),
-                    () =>
-                    {
-                        controlling = false;
-                        engineCancellation?.Cancel();
-                    },
-                    AwaitBackgroundTaskAsync);
-            }
-            catch (Exception exception) when (exception is not OperationCanceledException)
-            {
-                RaiseStatus(
-                    $"Network restoration reported an error; closing safely: {exception.Message}");
-            }
-
-            if (arpDevice is not null)
-            {
-                try
-                {
-                    arpDevice.StopCapture();
-                }
-                catch (InvalidOperationException)
-                {
-                }
-
-                arpDevice.OnPacketArrival -= OnArpPacketArrival;
-                arpDevice.Close();
-                arpDevice = null;
-            }
-
-            if (forwardingDevice is not null)
-            {
-                forwardingDevice.Close();
-                forwardingDevice = null;
-            }
-
-            engineCancellation?.Dispose();
-            engineCancellation = null;
-            backgroundTask = null;
-            frameRouter = null;
-            gatewayMac = null;
-            profile = null;
-            restoring = false;
-            var failure = backgroundFailure;
-            var stoppedMessage = failure is null
-                ? "Stopped. Corrective ARP mappings were sent."
-                : $"Stopped after an engine error: {failure}. Corrective ARP mappings were sent.";
-            RaiseStatus(stoppedMessage);
-            RaiseStateChanged(false, stoppedMessage, failure);
         }
         finally
         {
             stopSync.Release();
         }
+    }
+
+    private async Task StopCoreAsync()
+    {
+        if (!IsRunning && profile is null && SessionId == 0)
+        {
+            return;
+        }
+
+        restoring = true;
+        lock (identitySync)
+        {
+            activeSessionId = 0;
+            latestIdentities.Clear();
+            nameRetryGate.EndSession();
+            clientMappings.FreezeBindings();
+            gatewayResolution?.TrySetCanceled();
+            gatewayResolution = null;
+        }
+
+        var restorationTargets = clientMappings.GetRestorationTargets();
+        var hadRestorationTargets = restorationTargets.Count > 0;
+        var warnings = new List<string>();
+        if (hadRestorationTargets && (profile is null || gatewayMac is null || arpDevice is null))
+        {
+            warnings.Add("Corrective IPv4 ARP could not be sent: adapter, gateway, or capture handle unavailable");
+        }
+
+        if (restorationTargets.Any(target => !target.RestoreGatewayMapping))
+        {
+            warnings.Add("Retired IPv4 bindings receive client-side repair/recovery only; old gateway ownership is unverified");
+        }
+        try
+        {
+            await ForwardingShutdown.RunAsync(
+                () => arpDevice is null ? Task.CompletedTask : RestoreArpAsync(),
+                () =>
+                {
+                    controlling = false;
+                    engineCancellation?.Cancel();
+                },
+                AwaitBackgroundTaskAsync).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            warnings.Add($"ARP restoration could not be confirmed: {exception.Message}");
+            RaiseStatus($"Network restoration reported an error; closing capture handles: {exception.Message}");
+        }
+
+        UpdateCaptureStatistics();
+        if (arpDevice is { } activeArpDevice)
+        {
+            try
+            {
+                activeArpDevice.StopCapture();
+            }
+            catch (Exception exception)
+            {
+                warnings.Add($"ARP capture stop reported: {exception.Message}");
+            }
+            finally
+            {
+                activeArpDevice.OnPacketArrival -= OnArpPacketArrival;
+                try
+                {
+                    activeArpDevice.Close();
+                }
+                catch (Exception exception)
+                {
+                    warnings.Add($"ARP handle close reported: {exception.Message}");
+                }
+
+                arpDevice = null;
+            }
+        }
+
+        if (forwardingDevice is { } activeForwardingDevice)
+        {
+            try
+            {
+                activeForwardingDevice.Close();
+            }
+            catch (Exception exception)
+            {
+                warnings.Add($"Data handle close reported: {exception.Message}");
+            }
+
+            forwardingDevice = null;
+        }
+
+        cancellationRegistration.Dispose();
+        engineCancellation?.Dispose();
+        engineCancellation = null;
+        backgroundTask = null;
+        frameRouter = null;
+        localMeter = null;
+        gatewayMac = null;
+        profile = null;
+        restoring = false;
+        var failure = backgroundFailure;
+        StopStatus = EngineStopStatus.Format(hadRestorationTargets, warnings, failure);
+        RaiseStatus(StopStatus);
+        RaiseStateChanged(false, StopStatus, failure ?? warnings.FirstOrDefault());
     }
 
     public async Task ApplyRuleAsync(string macAddress, TrafficRule rule)
@@ -468,9 +710,9 @@ public sealed class PcapLanEngine : IAsyncDisposable
                         normalizedMac,
                         StringComparison.Ordinal))
                 {
-                    await ApplyInterceptionTransitionAsync(
+                    await Task.Run(() => ApplyInterceptionTransitionAsync(
                         client,
-                        InterceptionTransition.Between(previousTargets, currentTargets));
+                        InterceptionTransition.Between(previousTargets, currentTargets))).ConfigureAwait(false);
                     break;
                 }
             }
@@ -485,9 +727,17 @@ public sealed class PcapLanEngine : IAsyncDisposable
 
     private void OnArpPacketArrival(object sender, PacketCapture capture)
     {
-        if (EthernetFrameCodec.TryParseArp(capture.Data, out var arp))
+        diagnostics.RecordArpFrame();
+        try
         {
-            ObserveArp(arp);
+            if (EthernetFrameCodec.TryParseArp(capture.Data, out var arp))
+            {
+                ObserveArp(arp);
+            }
+        }
+        catch (Exception exception)
+        {
+            HandleBackgroundFailure("ARP processing failed", exception);
         }
     }
 
@@ -503,6 +753,11 @@ public sealed class PcapLanEngine : IAsyncDisposable
             while (!cancellationToken.IsCancellationRequested)
             {
                 var status = activeDevice.GetNextPacket(out var capture);
+                if (status == GetPacketStatus.Error)
+                {
+                    diagnostics.RecordCaptureReadFailure();
+                }
+
                 if (!startupReported)
                 {
                     ForwarderStartupPolicy.ObserveFirstRead(
@@ -540,22 +795,23 @@ public sealed class PcapLanEngine : IAsyncDisposable
 
     private void ProcessForwardingFrame(ReadOnlySpan<byte> bytes)
     {
-        if (!controlling || frameRouter is null)
+        diagnostics.RecordCapturedFrame(bytes);
+        var router = frameRouter;
+        var activeProfile = profile;
+        if (!controlling || router is null || activeProfile is null)
         {
             return;
         }
 
-        if (DhcpHostNameParser.TryParse(bytes, out var dhcpHost))
+        ObserveDhcpIdentity(bytes);
+        if (localMeter is { } meter && meter.TryMeasure(bytes, out var localTraffic))
         {
-            registry.SetHostName(dhcpHost.MacAddress, dhcpHost.HostName);
-            DeviceIdentityLearned?.Invoke(
-                this,
-                new DeviceIdentityLearnedEventArgs(
-                    dhcpHost.MacAddress,
-                    dhcpHost.HostName));
+            registry.RecordTraffic(activeProfile.LocalMac, localTraffic.Direction, localTraffic.PayloadByteCount);
+            diagnostics.RecordLocalTraffic(activeProfile.LocalMac, localTraffic);
         }
 
-        var result = frameRouter.Route(bytes);
+        var result = router.Route(bytes);
+        diagnostics.RecordRoute(result);
         if (result.Direction is not null && result.ClientMac is not null)
         {
             registry.RecordTraffic(
@@ -581,6 +837,7 @@ public sealed class PcapLanEngine : IAsyncDisposable
         {
             SendForwardingPacket(result.Frame);
             Interlocked.Increment(ref forwardedPacketCount);
+            diagnostics.RecordForwardedPacket();
         }
         else if (result.Action == FrameAction.Drop)
         {
@@ -592,36 +849,62 @@ public sealed class PcapLanEngine : IAsyncDisposable
     {
         var clients = clientMappings.Mappings;
         var activeProfile = profile;
-        if (activeProfile is null ||
+        if (activeProfile is null || restoring || SessionId == 0 ||
             !arp.HasConsistentSender ||
             arp.SenderIp.Equals(IPAddress.Any) ||
             arp.SenderMac.Equals(activeProfile.LocalMac) ||
-            IsZeroOrBroadcast(arp.SenderMac))
+            !TrafficMetering.IsUnicastMac(arp.SenderMac))
         {
             return;
         }
 
         if (arp.SenderIp.Equals(activeProfile.GatewayAddress))
         {
+            if (gatewayMac is not null && !gatewayMac.Equals(arp.SenderMac))
+            {
+                diagnostics.RecordMappingUpdate(new ClientMappingUpdate(
+                    false, false, false, 0, ClientMappingRejection.GatewayOrProxyMac));
+                return;
+            }
+
             gatewayResolution?.TrySetResult(arp.SenderMac);
+            registry.Observe(arp.SenderIp, arp.SenderMac, DateTimeOffset.UtcNow, "Gateway");
             RespondToArpRequest(arp);
             return;
         }
 
-        var needsPoison = clientMappings.Upsert(arp.SenderIp, arp.SenderMac);
-        activeProbeReplies?.TryAdd(arp.SenderIp, arp.SenderMac);
-        activeKnownDeviceReplies?.TryAdd(
-            TrafficPolicy.NormalizeMac(arp.SenderMac.ToString()),
-            arp.SenderIp);
-        frameRouter?.UpdateClient(arp.SenderIp, arp.SenderMac);
-        registry.Observe(
-            arp.SenderIp,
-            arp.SenderMac,
-            DateTimeOffset.UtcNow,
-            GetKnownHostName(arp.SenderMac));
+        var update = clientMappings.UpsertChecked(arp.SenderIp, arp.SenderMac);
+        diagnostics.RecordMappingUpdate(update);
+        if (!update.Accepted)
+        {
+            if (!clients.ContainsKey(arp.SenderIp))
+            {
+                frameRouter?.RemoveClient(arp.SenderIp);
+            }
+
+            return;
+        }
+
+        if (!clientMappings.WithCurrentBinding(arp.SenderIp, arp.SenderMac, update.BindingVersion, () =>
+            {
+                activeProbeReplies?.TryAdd(arp.SenderIp, arp.SenderMac);
+                activeKnownDeviceReplies?.TryAdd(
+                    TrafficPolicy.NormalizeMac(arp.SenderMac.ToString()),
+                    arp.SenderIp);
+                frameRouter?.UpdateClient(arp.SenderIp, arp.SenderMac);
+                registry.Observe(
+                    arp.SenderIp,
+                    arp.SenderMac,
+                    DateTimeOffset.UtcNow,
+                    GetKnownHostName(arp.SenderMac));
+            }))
+        {
+            return;
+        }
+
         _ = ResolveNameAsync(arp.SenderIp, arp.SenderMac);
         RespondToArpRequest(arp);
-        if (controlling && needsPoison)
+        if (controlling && update.Changed)
         {
             PoisonClient(
                 new KeyValuePair<IPAddress, PhysicalAddress>(
@@ -632,35 +915,103 @@ public sealed class PcapLanEngine : IAsyncDisposable
 
     private async Task ResolveNameAsync(IPAddress address, PhysicalAddress mac)
     {
-        var key = mac.ToString();
-        if (!resolvingNames.TryAdd(key, 0))
+        var session = SessionId;
+        if (!controlling || restoring ||
+            !clientMappings.TryGetBinding(address, mac, out var version, requireObserved: true) ||
+            !nameRetryGate.TryBegin(session, address, mac, version, out var attempt))
         {
             return;
         }
 
-        var netBiosTask = NetBiosNameResolver.ResolveAsync(address);
-        var mdnsTask = MdnsNameResolver.ResolveAsync(address);
-        var dnsTask = ResolveDnsNameAsync(address);
-        await Task.WhenAll(netBiosTask, mdnsTask, dnsTask);
-        foreach (var name in new[] { netBiosTask.Result, mdnsTask.Result, dnsTask.Result })
+        var resolved = false;
+        try
         {
-            if (resolvedNameClaims.TryClaim(
-                    mac,
-                    name,
-                    out var acceptedName,
-                    out var isNewClaim))
+            var netBiosTask = NetBiosNameResolver.ResolveAsync(address);
+            var mdnsTask = MdnsNameResolver.ResolveAsync(address);
+            var dnsTask = ResolveDnsNameAsync(address);
+            await Task.WhenAll(netBiosTask, mdnsTask, dnsTask).ConfigureAwait(false);
+            foreach (var name in new[] { netBiosTask.Result, mdnsTask.Result, dnsTask.Result })
             {
-                registry.SetHostName(mac, acceptedName);
-                if (isNewClaim)
+                if (TryApplyIdentity(session, address, mac, version, name, attempt))
                 {
-                    DeviceIdentityLearned?.Invoke(
-                        this,
-                        new DeviceIdentityLearnedEventArgs(mac, acceptedName));
+                    resolved = true;
+                    return;
                 }
-
-                return;
             }
         }
+        catch (Exception)
+        {
+            // A resolver failure must release the in-flight gate and remain retryable.
+        }
+        finally
+        {
+            nameRetryGate.Complete(attempt, resolved);
+        }
+    }
+
+    private void ObserveDhcpIdentity(ReadOnlySpan<byte> bytes)
+    {
+        if (DhcpHostNameParser.TryParse(bytes, out var dhcp) &&
+            EthernetFrameCodec.TryParseIpv4(bytes, out var ipv4) &&
+            ipv4.SourceMac.Equals(dhcp.MacAddress) &&
+            clientMappings.TryGetBinding(
+                ipv4.Source, dhcp.MacAddress, out var version, requireObserved: true))
+        {
+            TryApplyIdentity(SessionId, ipv4.Source, dhcp.MacAddress, version, dhcp.HostName);
+        }
+    }
+
+    private bool TryApplyIdentity(
+        long session,
+        IPAddress address,
+        PhysicalAddress mac,
+        long version,
+        string? name,
+        NameResolutionAttempt? attempt = null)
+    {
+        DeviceIdentityLearnedEventArgs? identity = null;
+        var accepted = false;
+        lock (identitySync)
+        {
+            if (!controlling || restoring || session == 0 || session != SessionId ||
+                (attempt is { } activeAttempt && !nameRetryGate.IsCurrentAttempt(activeAttempt)))
+            {
+                return false;
+            }
+
+            clientMappings.WithCurrentBinding(address, mac, version, () =>
+            {
+                if (!resolvedNameClaims.TryClaim(mac, name, out var acceptedName, out var isNewClaim))
+                {
+                    return;
+                }
+
+                accepted = true;
+                registry.SetHostName(mac, acceptedName);
+                if (attempt is null)
+                {
+                    nameRetryGate.MarkResolved(session, address, mac, version);
+                }
+
+                var macKey = mac.ToString();
+                if (isNewClaim || !latestIdentities.TryGetValue(macKey, out var previousIdentity) ||
+                    previousIdentity.SessionId != session || !Equals(previousIdentity.Address, address) ||
+                    !issuedIdentities.TryGetValue(previousIdentity, out var previousBinding) ||
+                    previousBinding.Version != version)
+                {
+                    identity = new DeviceIdentityLearnedEventArgs(mac, acceptedName, session, address);
+                    issuedIdentities.Add(identity, new IdentityBinding(version));
+                    latestIdentities[macKey] = identity;
+                }
+            }, requireObserved: true);
+        }
+
+        if (identity is not null)
+        {
+            DeviceIdentityLearned?.Invoke(this, identity);
+        }
+
+        return accepted;
     }
 
     private static async Task<string?> ResolveDnsNameAsync(IPAddress address)
@@ -692,8 +1043,24 @@ public sealed class PcapLanEngine : IAsyncDisposable
     private async Task RunMaintenanceAsync(CancellationToken cancellationToken)
     {
         await Task.WhenAll(
-            RunPoisonLoopAsync(cancellationToken),
-            RunNeighborRefreshLoopAsync(cancellationToken));
+            RunMaintenanceWorkerAsync(() => RunPoisonLoopAsync(cancellationToken), cancellationToken),
+            RunMaintenanceWorkerAsync(() => RunNeighborRefreshLoopAsync(cancellationToken), cancellationToken))
+            .ConfigureAwait(false);
+    }
+
+    private async Task RunMaintenanceWorkerAsync(Func<Task> worker, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await worker().ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            HandleBackgroundFailure("Maintenance failed", exception);
+        }
     }
 
     private async Task RunPoisonLoopAsync(CancellationToken cancellationToken)
@@ -719,6 +1086,7 @@ public sealed class PcapLanEngine : IAsyncDisposable
         {
             while (await refreshTimer.WaitForNextTickAsync(cancellationToken))
             {
+                UpdateCaptureStatistics();
                 if (discoveryProfile.ProbeSubnetOnRefresh)
                 {
                     await RefreshNeighborsAsync(cancellationToken);
@@ -762,6 +1130,12 @@ public sealed class PcapLanEngine : IAsyncDisposable
     {
         foreach (var client in clientMappings.Mappings)
         {
+            if (!controlling || restoring ||
+                !TrafficMetering.CanInterceptClient(activeProfile, client.Key, client.Value, gatewayMac))
+            {
+                continue;
+            }
+
             SendArpPacket(
                 EthernetFrameCodec.BuildUnicastArpRequest(
                     activeProfile.LocalMac,
@@ -789,23 +1163,54 @@ public sealed class PcapLanEngine : IAsyncDisposable
 
     private async Task RestoreArpAsync()
     {
-        var clients = clientMappings.Mappings;
+        var clients = clientMappings.GetRestorationTargets();
         var activeProfile = profile;
         var activeGatewayMac = gatewayMac;
-        if (activeProfile is null || activeGatewayMac is null)
+        if (activeProfile is null || activeGatewayMac is null || clients.Count == 0)
         {
             return;
         }
 
+        var failures = 0;
+        string? firstFailure = null;
         for (var attempt = 0; attempt < 3; attempt++)
         {
             foreach (var pair in clients)
             {
-                SendRestoreFrames(pair, activeProfile, activeGatewayMac);
+                try
+                {
+                    SendRestoreFrames(pair, activeProfile, activeGatewayMac);
+                }
+                catch (Exception exception)
+                {
+                    failures++;
+                    firstFailure ??= exception.Message;
+                }
             }
 
-            await Task.Delay(120);
+            await Task.Delay(120).ConfigureAwait(false);
         }
+
+        if (failures > 0)
+        {
+            throw new InvalidOperationException($"{failures} corrective ARP attempts failed: {firstFailure}");
+        }
+    }
+
+    private bool RememberInterception(IPAddress address, PhysicalAddress mac, long version)
+    {
+        if (clientMappings.RememberInterception(address, mac, version))
+        {
+            return true;
+        }
+
+        if (controlling && !restoring && clientMappings.IsCurrentBinding(address, mac, version))
+        {
+            diagnostics.RecordMappingUpdate(new ClientMappingUpdate(
+                false, false, false, 0, ClientMappingRejection.RestorationCapacityReached));
+        }
+
+        return false;
     }
 
     private void PoisonClient(KeyValuePair<IPAddress, PhysicalAddress> client)
@@ -820,31 +1225,41 @@ public sealed class PcapLanEngine : IAsyncDisposable
         var activeProfile = profile;
         var activeGatewayMac = gatewayMac;
         if (!controlling || restoring || targets == InterceptionTargets.None ||
-            activeProfile is null || activeGatewayMac is null)
+            activeProfile is null || activeGatewayMac is null ||
+            !TrafficMetering.CanInterceptClient(activeProfile, client.Key, client.Value, activeGatewayMac) ||
+            !clientMappings.TryGetBinding(client.Key, client.Value, out var version))
         {
             return;
         }
 
-        var frames = ArpInterceptionFrames.BuildPoison(
-            activeProfile.LocalMac,
-            activeProfile.GatewayAddress,
-            activeGatewayMac,
-            client.Key,
-            client.Value);
-        foreach (var frame in frames.Select(targets))
+        clientMappings.WithCurrentBinding(client.Key, client.Value, version, () =>
         {
-            SendArpPacket(frame);
-        }
+            if (!controlling || restoring || !RememberInterception(client.Key, client.Value, version))
+            {
+                return;
+            }
 
-        var controllerFrames = ArpInterceptionFrames.BuildControllerProtection(
-            activeProfile.LocalMac,
-            activeProfile.LocalAddress,
-            activeGatewayMac,
-            activeProfile.GatewayAddress,
-            client.Value,
-            client.Key);
-        SendArpPacket(controllerFrames.ClientToController);
-        SendArpPacket(controllerFrames.GatewayToController);
+            var frames = ArpInterceptionFrames.BuildPoison(
+                activeProfile.LocalMac,
+                activeProfile.GatewayAddress,
+                activeGatewayMac,
+                client.Key,
+                client.Value);
+            foreach (var frame in frames.Select(targets))
+            {
+                SendArpPacket(frame);
+            }
+
+            var controllerFrames = ArpInterceptionFrames.BuildControllerProtection(
+                activeProfile.LocalMac,
+                activeProfile.LocalAddress,
+                activeGatewayMac,
+                activeProfile.GatewayAddress,
+                client.Value,
+                client.Key);
+            SendArpPacket(controllerFrames.ClientToController);
+            SendArpPacket(controllerFrames.GatewayToController);
+        });
     }
 
     private async Task ApplyInterceptionTransitionAsync(
@@ -885,24 +1300,39 @@ public sealed class PcapLanEngine : IAsyncDisposable
         AdapterProfile activeProfile,
         PhysicalAddress activeGatewayMac)
     {
-        var restoreFrames = ArpInterceptionFrames.BuildRestore(
-            activeProfile.LocalMac,
-            activeProfile.GatewayAddress,
-            activeGatewayMac,
-            client.Key,
-            client.Value);
-        SendArpPacket(restoreFrames.ToClient);
-        SendArpPacket(restoreFrames.ToGateway);
+        if (clientMappings.TryGetBinding(client.Key, client.Value, out var version))
+        {
+            clientMappings.WithCurrentBinding(client.Key, client.Value, version, () =>
+                SendRestoreFrames(new ClientRestorationTarget(client.Key, client.Value, true),
+                    activeProfile, activeGatewayMac));
+        }
+    }
 
-        // Also ask a connected client to answer the gateway itself. The direct
-        // replies above cover clients that disconnected before restoration.
-        var recoveryRequest = ArpInterceptionFrames.BuildRecoveryRequest(
-            activeProfile.LocalMac,
-            activeGatewayMac,
-            activeProfile.GatewayAddress,
-            client.Value,
-            client.Key);
-        SendArpPacket(recoveryRequest);
+    private void SendRestoreFrames(
+        ClientRestorationTarget target,
+        AdapterProfile activeProfile,
+        PhysicalAddress activeGatewayMac)
+    {
+        var failures = 0;
+        Exception? firstFailure = null;
+        foreach (var frame in ClientRestorationFrames.Build(activeProfile, activeGatewayMac, target))
+        {
+            try
+            {
+                SendArpPacket(frame);
+            }
+            catch (Exception exception)
+            {
+                failures++;
+                firstFailure ??= exception;
+            }
+        }
+
+        if (failures > 0)
+        {
+            throw new InvalidOperationException(
+                $"{failures} corrective ARP frame sends failed: {firstFailure!.Message}", firstFailure);
+        }
     }
 
     private void RespondToArpRequest(ArpFrameInfo request)
@@ -919,50 +1349,68 @@ public sealed class PcapLanEngine : IAsyncDisposable
         }
 
         if (request.TargetIp.Equals(activeProfile.GatewayAddress) &&
-            clients.TryGetValue(request.SenderIp, out var requestingClient))
+            clients.TryGetValue(request.SenderIp, out var requestingClient) &&
+            request.SenderMac.Equals(requestingClient))
         {
-            if (!policy.GetInterceptionTargets(requestingClient.ToString())
-                    .HasFlag(InterceptionTargets.Client))
-            {
-                return;
-            }
-
-            var frames = ArpInterceptionFrames.BuildPoison(
-                activeProfile.LocalMac,
-                activeProfile.GatewayAddress,
-                activeGatewayMac,
-                request.SenderIp,
-                requestingClient);
-            SendArpPacket(frames.ToClient);
+            SendInterceptionReply(request.SenderIp, requestingClient, InterceptionTargets.Client,
+                activeProfile, activeGatewayMac);
             return;
         }
 
         if (request.SenderIp.Equals(activeProfile.GatewayAddress) &&
+            request.SenderMac.Equals(activeGatewayMac) &&
             clients.TryGetValue(request.TargetIp, out var requestedClient))
         {
-            if (!policy.GetInterceptionTargets(requestedClient.ToString())
-                    .HasFlag(InterceptionTargets.Gateway))
+            SendInterceptionReply(request.TargetIp, requestedClient, InterceptionTargets.Gateway,
+                activeProfile, activeGatewayMac);
+        }
+    }
+
+    private void SendInterceptionReply(
+        IPAddress address,
+        PhysicalAddress mac,
+        InterceptionTargets target,
+        AdapterProfile activeProfile,
+        PhysicalAddress activeGatewayMac)
+    {
+        if (!TrafficMetering.CanInterceptClient(activeProfile, address, mac, activeGatewayMac) ||
+            !clientMappings.TryGetBinding(address, mac, out var version))
+        {
+            return;
+        }
+
+        clientMappings.WithCurrentBinding(address, mac, version, () =>
+        {
+            if (!controlling || restoring || !policy.GetInterceptionTargets(mac.ToString()).HasFlag(target) ||
+                !RememberInterception(address, mac, version))
             {
                 return;
             }
 
             var frames = ArpInterceptionFrames.BuildPoison(
-                activeProfile.LocalMac,
-                activeProfile.GatewayAddress,
-                activeGatewayMac,
-                request.TargetIp,
-                requestedClient);
-            SendArpPacket(frames.ToGateway);
-        }
+                activeProfile.LocalMac, activeProfile.GatewayAddress, activeGatewayMac, address, mac);
+            foreach (var frame in frames.Select(target))
+            {
+                SendArpPacket(frame);
+            }
+        });
     }
 
     private void SendArpPacket(byte[] bytes)
     {
-        var activeDevice = arpDevice ??
-            throw new InvalidOperationException("The ARP capture adapter is not open.");
-        lock (arpSendSync)
+        try
         {
-            activeDevice.SendPacket(bytes);
+            var activeDevice = arpDevice ??
+                throw new InvalidOperationException("The ARP capture adapter is not open.");
+            lock (arpSendSync)
+            {
+                activeDevice.SendPacket(bytes);
+            }
+        }
+        catch (Exception)
+        {
+            diagnostics.RecordInjectionFailure(arp: true);
+            throw;
         }
     }
 
@@ -972,8 +1420,19 @@ public sealed class PcapLanEngine : IAsyncDisposable
         // packet injection through it with ERROR_BAD_UNIT (20). The ARP handle
         // has already proven that it can inject on this adapter, and capture
         // filters do not restrict packets sent through a handle.
-        var activeDevice = PacketInjectionPolicy.SelectHandle(arpDevice, forwardingDevice);
-        var frames = PacketInjectionPolicy.PrepareFrames(bytes);
+        LibPcapLiveDevice activeDevice;
+        IReadOnlyList<byte[]> frames;
+        try
+        {
+            activeDevice = PacketInjectionPolicy.SelectHandle(arpDevice, forwardingDevice);
+            frames = PacketInjectionPolicy.PrepareFrames(bytes);
+        }
+        catch (Exception)
+        {
+            diagnostics.RecordInjectionFailure(arp: false);
+            throw;
+        }
+
         for (var index = 0; index < frames.Count; index++)
         {
             var frame = frames[index];
@@ -986,6 +1445,7 @@ public sealed class PcapLanEngine : IAsyncDisposable
             }
             catch (Exception exception)
             {
+                diagnostics.RecordInjectionFailure(arp: false);
                 var adapterName = profile?.Name ?? "unknown adapter";
                 throw new InvalidOperationException(
                     $"Npcap rejected a forwarded frame on '{adapterName}' " +
@@ -1012,24 +1472,53 @@ public sealed class PcapLanEngine : IAsyncDisposable
         }
         catch (Exception exception)
         {
+            Interlocked.CompareExchange(
+                ref backgroundFailure, $"Worker shutdown reported: {exception.Message}", null);
             RaiseStatus(
                 $"Forwarding stopped unexpectedly; restoring network: {exception.Message}");
         }
     }
 
-    private static bool IsZeroOrBroadcast(PhysicalAddress address)
+    private void UpdateCaptureStatistics()
     {
-        var bytes = address.GetAddressBytes();
-        return bytes.All(value => value == 0) || bytes.All(value => value == 0xff);
+        ReadStatistics(arpDevice, true);
+        ReadStatistics(forwardingDevice, false);
     }
+
+    private void ReadStatistics(LibPcapLiveDevice? device, bool arp)
+    {
+        if (device is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var statistics = device.Statistics;
+            diagnostics.SetCaptureStatistics(arp, new CaptureHandleStatistics(
+                statistics.ReceivedPackets,
+                statistics.DroppedPackets,
+                statistics.InterfaceDroppedPackets));
+        }
+        catch (Exception exception)
+        {
+            diagnostics.SetCaptureStatistics(arp, null, exception.Message);
+        }
+    }
+
+    private sealed record IdentityBinding(long Version);
 
     private void HandleBackgroundFailure(string source, Exception exception)
     {
+        var failedSession = SessionId;
         var failure = $"{source}: {exception.Message}";
-        Interlocked.CompareExchange(ref backgroundFailure, failure, null);
+        if (Interlocked.CompareExchange(ref backgroundFailure, failure, null) is not null)
+        {
+            return;
+        }
+
         RaiseStatus($"{failure}; restoring the network.");
-        engineCancellation?.Cancel();
-        _ = Task.Run(StopAsync);
+        _ = Task.Run(() => StopSessionAsync(failedSession));
     }
 
     private void RaiseStatus(string message) => StatusChanged?.Invoke(this, message);

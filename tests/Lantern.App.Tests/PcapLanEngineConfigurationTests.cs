@@ -40,7 +40,28 @@ public sealed class PcapLanEngineConfigurationTests
     }
 
     [Fact]
-    public void KnownDeviceHints_SuppressAmbiguousLearnedNamesButKeepAliases()
+    public void ForwardingFilter_ObservesIpv6WithoutAddingIpv6Interception()
+    {
+        Assert.Equal("ip or ip6", PcapLanEngine.ForwardingFilter);
+    }
+
+    [Fact]
+    public void Engine_ExposesHonestDiagnosticsAndRejectsUnscopedIdentityEventsWithoutStartingCapture()
+    {
+        var engine = new PcapLanEngine(new Lantern.Core.Devices.DeviceRegistry(), new Lantern.Core.Control.TrafficPolicy());
+        var legacyIdentity = new DeviceIdentityLearnedEventArgs(
+            PhysicalAddress.Parse("0E4F69CCE4F0"), "POCO-F6");
+
+        Assert.False(engine.IsRunning);
+        Assert.False(engine.IsIdentityCurrent(legacyIdentity));
+        Assert.Equal(0, engine.SessionId);
+        Assert.Contains("not complete", engine.GetDiagnosticsSummary());
+        Assert.Contains("not proof of zero", engine.GetCoverageStatus("0E4F69CCE4F0"));
+        Assert.Contains("no network restoration was attempted", engine.StopStatus);
+    }
+
+    [Fact]
+    public void KnownDeviceHints_KeepPerMacLearnedNamesAndNeverUseAliases()
     {
         var settings = new AppSettings
         {
@@ -62,23 +83,23 @@ public sealed class PcapLanEngineConfigurationTests
 
         var hints = KnownDeviceHintFactory.Build(settings);
 
-        Assert.Equal("My phone", hints.Single(hint =>
+        Assert.Equal("Humane", hints.Single(hint =>
             hint.MacAddress.Equals(PhysicalAddress.Parse("0E4F69CCE4F0"))).HostName);
-        Assert.Null(hints.Single(hint =>
+        Assert.Equal("Humane", hints.Single(hint =>
             hint.MacAddress.Equals(PhysicalAddress.Parse("D2574CDCA5B2"))).HostName);
     }
 
     [Fact]
-    public void ResolvedDeviceNames_RejectControllerAndCrossDeviceDuplicates()
+    public void ResolvedDeviceNames_ArePerMacEvenWhenANameMatchesAnotherDeviceOrController()
     {
         var claims = new ResolvedDeviceNameClaims("Humane");
         var firstMac = PhysicalAddress.Parse("0E4F69CCE4F0");
         var secondMac = PhysicalAddress.Parse("D2574CDCA5B2");
 
-        Assert.False(claims.TryClaim(firstMac, "Humane", out _));
+        Assert.True(claims.TryClaim(firstMac, "Humane", out _));
         Assert.True(claims.TryClaim(firstMac, "POCO-F6", out var accepted));
         Assert.Equal("POCO-F6", accepted);
-        Assert.False(claims.TryClaim(secondMac, "POCO-F6", out _));
+        Assert.True(claims.TryClaim(secondMac, "POCO-F6", out _));
     }
 
     [Fact]

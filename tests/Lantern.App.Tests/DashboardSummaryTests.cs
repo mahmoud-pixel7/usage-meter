@@ -10,7 +10,7 @@ namespace Lantern.App.Tests;
 public sealed class DashboardSummaryTests
 {
     [Fact]
-    public void From_UsesOnlyControllableClientsForDashboardMetrics()
+    public void From_ExcludesTheGatewayFromDashboardMetrics()
     {
         var gateway = CreateDevice(
             "64644A380A15",
@@ -104,6 +104,99 @@ public sealed class DashboardSummaryTests
             StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void From_IncludesProtectedLocalComputerTrafficButOnlyCountsRecentPresence()
+    {
+        var gateway = CreateDevice(
+            "64644A380A15", "192.168.31.1", "Gateway", 90_000, 30_000, true, null);
+        var local = CreateDevice(
+            "345A6063C052",
+            "192.168.31.61",
+            "This desktop",
+            5_000,
+            800,
+            true,
+            new DevicePreferences { DownloadKiloBytesPerSecond = 500 },
+            "This computer — protected");
+        var phone = CreateDevice(
+            "0E4F69CCE4F0", "192.168.31.213", "Phone", 2_000, 400, false, null);
+        phone.SetPresence(false);
+
+        var summary = DashboardSummary.From([gateway, local, phone]);
+
+        Assert.Equal(1, summary.ConnectedDevices);
+        Assert.Equal(7_000, summary.DownloadBytesPerSecond);
+        Assert.Equal(1_200, summary.UploadBytesPerSecond);
+        Assert.Equal(0, summary.ConfiguredRules);
+        Assert.Equal("This desktop", summary.TopDeviceName);
+        Assert.Equal(new[] { "This desktop", "Phone" }, summary.DeviceTraffic.Select(device => device.DeviceName));
+    }
+
+    [Fact]
+    public void From_ReportsConfiguredPoliciesSeparatelyFromRecentPresenceAndMonitoring()
+    {
+        var recent = CreateDevice(
+            "345A6063C052", "192.168.31.61", "Desktop", 0, 0, false, null);
+        var remembered = CreateDevice(
+            "0E4F69CCE4F0",
+            "192.168.31.213",
+            "Phone",
+            2_000,
+            400,
+            false,
+            new DevicePreferences { PauseInternet = true });
+        remembered.SetPresence(false);
+        remembered.SetMonitoring(false);
+
+        var summary = DashboardSummary.From([recent, remembered]);
+
+        Assert.Equal(1, summary.ConnectedDevices);
+        Assert.Equal(1, summary.ConfiguredRules);
+        Assert.Equal(summary.ConfiguredRules, summary.ActiveRules);
+        Assert.Equal(0, summary.DownloadBytesPerSecond);
+        Assert.Equal(0, summary.UploadBytesPerSecond);
+        Assert.False(remembered.HasActiveRule);
+        Assert.True(remembered.HasConfiguredRule);
+    }
+
+    [Fact]
+    public void From_StoppedMonitoringDoesNotContributeStaleRatesOrInventATopDevice()
+    {
+        var device = CreateDevice(
+            "0E4F69CCE4F0", "192.168.31.213", "Phone", 2_000, 400, false, null);
+        device.SetMonitoring(false);
+
+        var summary = DashboardSummary.From([device]);
+
+        Assert.Equal(0, summary.DownloadBytesPerSecond);
+        Assert.Equal(0, summary.UploadBytesPerSecond);
+        Assert.Null(summary.TopDeviceName);
+        Assert.Equal(0, summary.TopDeviceDownloadBytesPerSecond);
+        Assert.Equal(0, summary.TopDeviceUploadBytesPerSecond);
+        var traffic = Assert.Single(summary.DeviceTraffic);
+        Assert.Equal(0, traffic.TotalBytesPerSecond);
+    }
+
+    [Fact]
+    public void From_ReclassifyingAPausedPeerAsLocalExcludesItsPolicyButKeepsItsTraffic()
+    {
+        var device = CreateDevice(
+            "0E4F69CCE4F0",
+            "192.168.31.213",
+            "Desktop",
+            2_000,
+            400,
+            false,
+            new DevicePreferences { PauseInternet = true });
+
+        device.SetProtection(true, "This computer — protected");
+        var summary = DashboardSummary.From([device]);
+
+        Assert.Equal(0, summary.ConfiguredRules);
+        Assert.Equal(2_000, summary.DownloadBytesPerSecond);
+        Assert.Equal("Desktop", summary.TopDeviceName);
+    }
+
     private static DeviceViewModel CreateDevice(
         string mac,
         string ip,
@@ -111,7 +204,8 @@ public sealed class DashboardSummaryTests
         double download,
         double upload,
         bool isProtected,
-        DevicePreferences? preferences)
+        DevicePreferences? preferences,
+        string? protectedReason = null)
     {
         var now = DateTimeOffset.Parse("2026-07-31T00:00:00Z");
         var snapshot = new DeviceSnapshot(
@@ -127,7 +221,7 @@ public sealed class DashboardSummaryTests
             snapshot,
             preferences,
             isProtected,
-            isProtected ? "Gateway — protected" : "Online");
+            protectedReason ?? (isProtected ? "Gateway — protected" : "Online"));
         return viewModel;
     }
 }

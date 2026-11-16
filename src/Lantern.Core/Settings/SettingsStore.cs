@@ -43,12 +43,30 @@ public sealed class SettingsStore
         await pathLock.WaitAsync(cancellationToken);
         try
         {
-            var loaded = await TryLoadAsync(
-                    settingsPath,
-                    PrimaryLoadAttempts,
-                    cancellationToken) ??
-                await TryLoadAsync(backupPath, attempts: 1, cancellationToken);
-            return Normalize(loaded ?? new AppSettings());
+            var primary = await ReadAsync(settingsPath, PrimaryLoadAttempts, cancellationToken);
+            if (primary.Settings is not null)
+            {
+                return Normalize(primary.Settings);
+            }
+
+            var backup = await ReadAsync(backupPath, attempts: 1, cancellationToken);
+            if (backup.Settings is not null)
+            {
+                return Normalize(backup.Settings);
+            }
+
+            if (primary.Status == SettingsReadStatus.Missing &&
+                backup.Status == SettingsReadStatus.Missing)
+            {
+                return Normalize(new AppSettings());
+            }
+
+            var error = primary.Error is not null && backup.Error is not null
+                ? new AggregateException(primary.Error, backup.Error)
+                : primary.Error ?? backup.Error;
+            throw new InvalidDataException(
+                "Saved device settings could not be read. The original files have not been replaced.",
+                error);
         }
         finally
         {
@@ -116,16 +134,12 @@ public sealed class SettingsStore
             Path.GetFullPath(settingsPath),
             static _ => new SemaphoreSlim(1, 1));
 
-    private static async Task<AppSettings?> TryLoadAsync(
+    private static async Task<SettingsReadResult> ReadAsync(
         string path,
         int attempts,
         CancellationToken cancellationToken)
     {
-        if (!File.Exists(path))
-        {
-            return null;
-        }
-
+        Exception? readError = null;
         for (var attempt = 1; attempt <= attempts; attempt++)
         {
             try
@@ -137,27 +151,90 @@ public sealed class SettingsStore
                     FileShare.ReadWrite | FileShare.Delete,
                     bufferSize: 4096,
                     useAsync: true);
-                return await JsonSerializer.DeserializeAsync<AppSettings>(
+                var loaded = await JsonSerializer.DeserializeAsync<AppSettings>(
                     stream,
                     JsonOptions,
                     cancellationToken);
+                if (loaded is null ||
+                    loaded.Devices is null || loaded.BlockedDomains is null ||
+                    loaded.AppliedDomainPresets is null ||
+                    loaded.Devices.Any(pair => pair.Value is null))
+                {
+                    return new SettingsReadResult(
+                        SettingsReadStatus.Failed,
+                        Error: new InvalidDataException($"Saved device settings in '{path}' are invalid."));
+                }
+
+                return new SettingsReadResult(SettingsReadStatus.Loaded, loaded);
             }
-            catch (JsonException)
+            catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
             {
-                return null;
+                return readError is null
+                    ? ClassifyMissingPath(path, exception)
+                    : new SettingsReadResult(SettingsReadStatus.Failed, Error: readError);
             }
-            catch (IOException) when (attempt < attempts)
+            catch (Exception exception) when (
+                exception is JsonException or UnauthorizedAccessException or System.Security.SecurityException)
             {
-                await Task.Delay(PrimaryLoadRetryDelay, cancellationToken);
+                return new SettingsReadResult(SettingsReadStatus.Failed, Error: exception);
             }
-            catch (IOException)
+            catch (IOException exception)
             {
-                return null;
+                readError = exception;
+                if (attempt < attempts)
+                {
+                    await Task.Delay(PrimaryLoadRetryDelay, cancellationToken);
+                }
             }
         }
 
-        return null;
+        return new SettingsReadResult(SettingsReadStatus.Failed, Error: readError);
     }
+
+    private static SettingsReadResult ClassifyMissingPath(string path, Exception missingError)
+    {
+        string? candidate = Path.GetFullPath(path);
+        var isSettingsFile = true;
+        while (candidate is not null)
+        {
+            try
+            {
+                var attributes = File.GetAttributes(candidate);
+                if (isSettingsFile || (attributes & FileAttributes.Directory) == 0)
+                {
+                    return new SettingsReadResult(
+                        SettingsReadStatus.Failed,
+                        Error: new IOException($"The settings path '{path}' could not be opened.", missingError));
+                }
+
+                return new SettingsReadResult(SettingsReadStatus.Missing);
+            }
+            catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+            {
+                isSettingsFile = false;
+                candidate = Path.GetDirectoryName(candidate);
+            }
+            catch (Exception exception) when (
+                exception is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                return new SettingsReadResult(SettingsReadStatus.Failed, Error: exception);
+            }
+        }
+
+        return new SettingsReadResult(SettingsReadStatus.Failed, Error: missingError);
+    }
+
+    private enum SettingsReadStatus
+    {
+        Missing,
+        Loaded,
+        Failed,
+    }
+
+    private sealed record SettingsReadResult(
+        SettingsReadStatus Status,
+        AppSettings? Settings = null,
+        Exception? Error = null);
 
     private static AppSettings Normalize(AppSettings settings)
     {
@@ -194,6 +271,7 @@ public sealed class SettingsStore
                     pair.Value.UploadKiloBytesPerSecond),
                 PauseInternet = pair.Value.PauseInternet,
                 LastKnownIp = NormalizeIpv4(pair.Value.LastKnownIp),
+                LastSeenUtc = pair.Value.LastSeenUtc?.ToUniversalTime(),
             };
         }
 

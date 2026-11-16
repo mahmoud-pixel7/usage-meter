@@ -189,7 +189,7 @@ public sealed class UsageLedgerTests
     }
 
     [Fact]
-    public void BeginSession_ClearsDevicesButKeepsTotalsAndPendingBytes()
+    public void BeginSession_KeepsInventoryTotalsAndPendingBytes()
     {
         var registry = new DeviceRegistry(Start);
         registry.Observe(IPAddress.Parse("192.168.31.61"), Phone, Start);
@@ -199,7 +199,9 @@ public sealed class UsageLedgerTests
 
         registry.BeginSession();
 
-        Assert.Empty(registry.Peek());
+        var remembered = Assert.Single(registry.Peek());
+        Assert.Equal(140, remembered.UsageTotalBytes);
+        Assert.Equal(0, remembered.TotalBytesPerSecond);
         Assert.Equal(new DeviceUsage(100, 40), registry.Usage.Get(Phone.ToString()));
 
         registry.Observe(IPAddress.Parse("192.168.31.61"), Phone, Start.AddMinutes(1));
@@ -308,9 +310,91 @@ public sealed class UsageLedgerTests
         }
     }
 
+    [Fact]
+    public void Ledger_AddOverflowDoesNotWrapCountersOrAdvanceTheRevision()
+    {
+        var ledger = new UsageLedger();
+        ledger.Add(Phone.ToString(), long.MaxValue - 2, 1);
+        var revision = ledger.Revision;
+
+        Assert.Throws<OverflowException>(() => ledger.Add(Phone.ToString(), 2, 0));
+
+        Assert.Equal(new DeviceUsage(long.MaxValue - 2, 1), ledger.Get(Phone.ToString()));
+        Assert.Equal(long.MaxValue - 1, ledger.Get(Phone.ToString()).TotalBytes);
+        Assert.Equal(revision, ledger.Revision);
+        Assert.Throws<OverflowException>(() => new DeviceUsage(long.MaxValue, 1).TotalBytes);
+    }
+
+    [Fact]
+    public void Ledger_RestoreInvalidInputDoesNotPartiallyApplyOrClampHistory()
+    {
+        var ledger = new UsageLedger();
+        ledger.Add(Phone.ToString(), 10, 2);
+        var revision = ledger.Revision;
+        var saved = new Dictionary<string, DeviceUsage>
+        {
+            [Phone.ToString()] = new(100, 20),
+            ["0E4F69CCE4F0"] = new(-1, 0),
+        };
+
+        Assert.Throws<ArgumentException>(() => ledger.Restore(saved));
+
+        Assert.Equal(new DeviceUsage(10, 2), ledger.Get(Phone.ToString()));
+        Assert.Single(ledger.Export().Devices);
+        Assert.Equal(revision, ledger.Revision);
+    }
+
+    [Fact]
+    public void Ledger_RestoreRejectsDuplicateNormalizedMacsInsteadOfAddingThemTwice()
+    {
+        var ledger = new UsageLedger();
+        var saved = new Dictionary<string, DeviceUsage>
+        {
+            [Phone.ToString()] = new(100, 20),
+            ["e2:61:19:0d:bd:54"] = new(100, 20),
+        };
+
+        Assert.Throws<ArgumentException>(() => ledger.Restore(saved));
+        Assert.Empty(ledger.Export().Devices);
+    }
+
+    [Fact]
+    public void Ledger_RestoreOverflowDoesNotPartiallyApplyEarlierEntries()
+    {
+        var ledger = new UsageLedger();
+        ledger.Add(Phone.ToString(), 10, 0);
+        ledger.Add("0E4F69CCE4F0", long.MaxValue - 1, 0);
+        var saved = new Dictionary<string, DeviceUsage>
+        {
+            [Phone.ToString()] = new(100, 20),
+            ["0E4F69CCE4F0"] = new(2, 0),
+        };
+
+        Assert.Throws<OverflowException>(() => ledger.Restore(saved));
+
+        Assert.Equal(new DeviceUsage(10, 0), ledger.Get(Phone.ToString()));
+        Assert.Equal(new DeviceUsage(long.MaxValue - 1, 0), ledger.Get("0E4F69CCE4F0"));
+    }
+
+    [Fact]
+    public void Tracker_LoadIsIdempotentAndNeverAddsSavedTotalsTwice()
+    {
+        using var temporary = new UsageTestDirectory();
+        var store = new UsageStore(temporary.DirectoryPath);
+        store.Save(new Dictionary<string, DeviceUsage> { [Phone.ToString()] = new(100, 20) });
+        var registry = new DeviceRegistry();
+        var tracker = new UsageTracker(registry, store);
+
+        tracker.Load();
+        tracker.Load();
+
+        Assert.Equal(new DeviceUsage(100, 20), registry.Usage.Get(Phone.ToString()));
+        Assert.False(tracker.SaveIfChanged());
+    }
+
     private static string CreateTemporaryDirectory()
     {
-        var path = Path.Combine(Path.GetTempPath(), $"UsageMeterTests-{Guid.NewGuid():N}");
+        var path = Path.Combine(Path.GetTempPath(), "opencode", $"UsageMeterTests-{Guid.NewGuid():N}");
         Directory.CreateDirectory(path);
         return path;
     }

@@ -2,7 +2,7 @@
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Usage Meter"
            Manufacturer="Usage Meter"
-           Version="1.0.0"
+           Version="1.0.1"
            UpgradeCode="4F2270F2-9144-4167-B5D5-A7CE75B5F00A"
            Scope="perMachine"
            InstallerVersion="500"
